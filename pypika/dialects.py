@@ -415,70 +415,89 @@ class PostgreSQLQuery(Query):
         return PostgreSQLQueryBuilder(**kwargs)
 
 
-class PostgreSQLQueryBuilder(QueryBuilder):
-    ALIAS_QUOTE_CHAR = '"'
-    QUERY_CLS = PostgreSQLQuery
+class ConflictQueryBuilder(QueryBuilder):
+    SUPPORTS_CONSTRAINT_CONFLICT_TARGET = True
 
     def __init__(self, **kwargs: Any) -> None:
-        super().__init__(dialect=Dialects.POSTGRESQL, **kwargs)
+        super().__init__(**kwargs)
         self._returns = []
         self._return_star = False
 
         self._on_conflict = False
-        self._on_conflict_fields = []
+        self._on_conflict_targets = []
+        self._on_conflict_constraint = None
         self._on_conflict_do_nothing = False
         self._on_conflict_do_updates = []
-        self._on_conflict_wheres = None
-        self._on_conflict_do_update_wheres = None
+        self._on_conflict_where = None
+        self._on_conflict_do_update_where = None
 
-        self._distinct_on = []
-
-        self._for_update_nowait = False
-        self._for_update_skip_locked = False
-        self._for_update_of = set()
-
-    def __copy__(self) -> PostgreSQLQueryBuilder:
+    def __copy__(self) -> ConflictQueryBuilder:
         newone = super().__copy__()
         newone._returns = copy(self._returns)
+        newone._on_conflict_targets = copy(self._on_conflict_targets)
         newone._on_conflict_do_updates = copy(self._on_conflict_do_updates)
         return newone
 
     @builder
-    def distinct_on(self, *fields: str | Term) -> None:
-        for field in fields:
-            if isinstance(field, str):
-                self._distinct_on.append(Field(field))
-            elif isinstance(field, Term):
-                self._distinct_on.append(field)
-
-    @builder
-    def for_update(self, nowait: bool = False, skip_locked: bool = False, of: tuple[str, ...] = ()) -> QueryBuilder:
-        self._for_update = True
-        self._for_update_skip_locked = skip_locked
-        self._for_update_nowait = nowait
-        self._for_update_of = set(of)
-
-    @builder
-    def on_conflict(self, *target_fields: str | Term) -> None:
+    def on_conflict(
+        self,
+        *target_fields: str | Term,
+        constraint: str | None = None,
+        constraint_name: str | None = None,
+        where: Criterion | None = None,
+        target_where: Criterion | None = None,
+    ) -> None:
         if not self._insert_table:
             raise QueryException("On conflict only applies to insert query")
 
-        self._on_conflict = True
+        if where is not None and target_where is not None:
+            raise QueryException("Can not specify both where and target_where")
+
+        if self._has_on_conflict_target():
+            raise QueryException("Can not define more than one conflict target")
+
+        if constraint is not None and constraint_name is not None:
+            raise QueryException("Can not specify both constraint and constraint_name")
+
+        constraint = constraint if constraint is not None else constraint_name
+
+        if constraint is not None:
+            if not self.SUPPORTS_CONSTRAINT_CONFLICT_TARGET:
+                raise QueryException("SQLite does not support ON CONSTRAINT conflict targets")
+            if target_fields:
+                raise QueryException("Can not specify an index target with a constraint target")
+            self._on_conflict_constraint = constraint
 
         for target_field in target_fields:
+            if target_field is None:
+                continue
             if isinstance(target_field, str):
-                self._on_conflict_fields.append(self._conflict_field_str(target_field))
+                self._on_conflict_targets.append(self._conflict_field_str(target_field))
             elif isinstance(target_field, Term):
-                self._on_conflict_fields.append(target_field)
+                self._on_conflict_targets.append(target_field)
+            else:
+                raise QueryException("Unsupported conflict target")
+
+        self._on_conflict = True
+        where = where if where is not None else target_where
+        if where is not None:
+            self._add_on_conflict_where(where, "where")
+
+    def _has_on_conflict_target(self) -> bool:
+        return self._on_conflict_constraint is not None or bool(self._on_conflict_targets)
 
     @builder
     def do_nothing(self) -> None:
         if len(self._on_conflict_do_updates) > 0:
             raise QueryException("Can not have two conflict handlers")
+        if self._on_conflict_do_update_where is not None:
+            raise QueryException("Can not combine DO NOTHING with DO UPDATE WHERE")
         self._on_conflict_do_nothing = True
 
     @builder
     def do_update(self, update_field: str | Field, update_value: Any | None = None) -> None:
+        if not self._on_conflict:
+            raise QueryException("Can not define a conflict update before an on conflict target")
         if self._on_conflict_do_nothing:
             raise QueryException("Can not have two conflict handlers")
 
@@ -495,6 +514,50 @@ class PostgreSQLQueryBuilder(QueryBuilder):
             self._on_conflict_do_updates.append((field, None))
 
     @builder
+    def on_conflict_where(self, criterion: Criterion) -> None:
+        self._add_on_conflict_where(criterion, self.on_conflict_where.__name__)
+
+    @builder
+    def target_where(self, criterion: Criterion) -> None:
+        self._add_on_conflict_where(criterion, self.target_where.__name__)
+
+    @builder
+    def do_update_where(self, criterion: Criterion) -> None:
+        self._add_do_update_where(criterion, self.do_update_where.__name__)
+
+    def _validate_conflict_criterion(self, criterion: Term | EmptyCriterion, method: str) -> None:
+        if not self._on_conflict:
+            raise QueryException(f"Can not call {method} before on conflict")
+        if isinstance(criterion, EmptyCriterion):
+            return
+        if not isinstance(criterion, Criterion):
+            raise QueryException(f"{method} requires a criterion")
+
+    def _add_on_conflict_where(self, criterion: Criterion, method: str) -> None:
+        self._validate_conflict_criterion(criterion, method)
+        if isinstance(criterion, EmptyCriterion):
+            return
+        if not self._has_on_conflict_target():
+            raise QueryException("Can not have fieldless ON CONFLICT WHERE")
+        if self._on_conflict_constraint is not None:
+            raise QueryException("Constraint conflict targets cannot have a target WHERE")
+        self._on_conflict_where = criterion if self._on_conflict_where is None else self._on_conflict_where & criterion
+
+    def _add_do_update_where(self, criterion: Criterion, method: str) -> None:
+        self._validate_conflict_criterion(criterion, method)
+        if isinstance(criterion, EmptyCriterion):
+            return
+        if not self._has_on_conflict_target():
+            raise QueryException("Can not have fieldless ON CONFLICT DO UPDATE WHERE")
+        if self._on_conflict_do_nothing:
+            raise QueryException("DO NOTHING does not support WHERE")
+        self._on_conflict_do_update_where = (
+            criterion
+            if self._on_conflict_do_update_where is None
+            else self._on_conflict_do_update_where & criterion
+        )
+
+    @builder
     def where(self, criterion: Criterion) -> None:
         if not self._on_conflict:
             return super().where(criterion)
@@ -502,69 +565,49 @@ class PostgreSQLQueryBuilder(QueryBuilder):
         if isinstance(criterion, EmptyCriterion):
             return
 
-        if self._on_conflict_do_nothing:
-            raise QueryException('DO NOTHING doest not support WHERE')
-
-        if self._on_conflict_fields and self._on_conflict_do_updates:
-            if self._on_conflict_do_update_wheres:
-                self._on_conflict_do_update_wheres &= criterion
-            else:
-                self._on_conflict_do_update_wheres = criterion
-        elif self._on_conflict_fields:
-            if self._on_conflict_wheres:
-                self._on_conflict_wheres &= criterion
-            else:
-                self._on_conflict_wheres = criterion
+        if len(self._on_conflict_do_updates) > 0:
+            self._add_do_update_where(criterion, self.where.__name__)
+        elif not self._on_conflict_do_nothing:
+            self._add_on_conflict_where(criterion, self.where.__name__)
         else:
-            raise QueryException('Can not have fieldless ON CONFLICT WHERE')
-
-    @builder
-    def using(self, table: Selectable | str) -> None:
-        self._using.append(table)
-
-    def _distinct_sql(self, **kwargs: Any) -> str:
-        if self._distinct_on:
-            return "DISTINCT ON({distinct_on}) ".format(
-                distinct_on=",".join(term.get_sql(with_alias=True, **kwargs) for term in self._distinct_on)
-            )
-        return super()._distinct_sql(**kwargs)
+            raise QueryException("DO NOTHING does not support WHERE")
 
     def _conflict_field_str(self, term: str) -> Field | None:
         if self._insert_table:
             return Field(term, table=self._insert_table)
 
+    def _on_conflict_target_sql(self, **kwargs: Any) -> str:
+        if self._on_conflict_constraint is not None:
+            return " ON CONSTRAINT {constraint}".format(
+                constraint=format_quotes(self._on_conflict_constraint, kwargs.get("quote_char"))
+            )
+
+        targets = [target.get_sql(with_alias=True, **kwargs) for target in self._on_conflict_targets]
+        return " ({targets})".format(targets=", ".join(targets))
+
     def _on_conflict_sql(self, **kwargs: Any) -> str:
         if not self._on_conflict_do_nothing and len(self._on_conflict_do_updates) == 0:
-            if not self._on_conflict_fields:
+            if not self._has_on_conflict_target():
                 return ""
             raise QueryException("No handler defined for on conflict")
 
-        if self._on_conflict_do_updates and not self._on_conflict_fields:
+        if self._on_conflict_do_updates and not self._has_on_conflict_target():
             raise QueryException("Can not have fieldless on conflict do update")
 
-        conflict_query = " ON CONFLICT"
-        if self._on_conflict_fields:
-            fields = [f.get_sql(with_alias=True, **kwargs) for f in self._on_conflict_fields]
-            conflict_query += " (" + ', '.join(fields) + ")"
+        if not self._on_conflict:
+            return ""
 
-        if self._on_conflict_wheres:
-            conflict_query += " WHERE {where}".format(where=self._on_conflict_wheres.get_sql(subquery=True, **kwargs))
+        conflict_query = " ON CONFLICT"
+        if self._has_on_conflict_target():
+            conflict_query += self._on_conflict_target_sql(**kwargs)
+
+        if self._on_conflict_where is not None:
+            conflict_query += " WHERE {where}".format(where=self._on_conflict_where.get_sql(subquery=True, **kwargs))
+
+        if self._on_conflict_do_nothing and self._on_conflict_do_update_where is not None:
+            raise QueryException("DO NOTHING does not support WHERE")
 
         return conflict_query
-
-    def _for_update_sql(self, **kwargs) -> str:
-        if self._for_update:
-            for_update = ' FOR UPDATE'
-            if self._for_update_of:
-                for_update += f' OF {", ".join([Table(item).get_sql(**kwargs) for item in self._for_update_of])}'
-            if self._for_update_nowait:
-                for_update += ' NOWAIT'
-            elif self._for_update_skip_locked:
-                for_update += ' SKIP LOCKED'
-        else:
-            for_update = ''
-
-        return for_update
 
     def _on_conflict_action_sql(self, **kwargs: Any) -> str:
         if self._on_conflict_do_nothing:
@@ -588,13 +631,80 @@ class PostgreSQLQueryBuilder(QueryBuilder):
                     )
             action_sql = " DO UPDATE SET {updates}".format(updates=",".join(updates))
 
-            if self._on_conflict_do_update_wheres:
+            if self._on_conflict_do_update_where is not None:
                 action_sql += " WHERE {where}".format(
-                    where=self._on_conflict_do_update_wheres.get_sql(subquery=True, with_namespace=True, **kwargs)
+                    where=self._on_conflict_do_update_where.get_sql(subquery=True, with_namespace=True, **kwargs)
                 )
             return action_sql
 
-        return ''
+        return ""
+
+    def get_sql(self, with_alias: bool = False, subquery: bool = False, **kwargs: Any) -> str:
+        self._set_kwargs_defaults(kwargs)
+
+        querystring = super().get_sql(with_alias, subquery, **kwargs)
+
+        querystring += self._on_conflict_sql(**kwargs)
+        querystring += self._on_conflict_action_sql(**kwargs)
+
+        if self._returns:
+            kwargs['with_namespace'] = self._update_table and self.from_
+            querystring += self._returning_sql(**kwargs)
+        return querystring
+
+
+class PostgreSQLQueryBuilder(ConflictQueryBuilder):
+    ALIAS_QUOTE_CHAR = '"'
+    QUERY_CLS = PostgreSQLQuery
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(dialect=Dialects.POSTGRESQL, **kwargs)
+
+        self._distinct_on = []
+
+        self._for_update_nowait = False
+        self._for_update_skip_locked = False
+        self._for_update_of = set()
+
+    @builder
+    def distinct_on(self, *fields: str | Term) -> None:
+        for field in fields:
+            if isinstance(field, str):
+                self._distinct_on.append(Field(field))
+            elif isinstance(field, Term):
+                self._distinct_on.append(field)
+
+    @builder
+    def for_update(self, nowait: bool = False, skip_locked: bool = False, of: tuple[str, ...] = ()) -> QueryBuilder:
+        self._for_update = True
+        self._for_update_skip_locked = skip_locked
+        self._for_update_nowait = nowait
+        self._for_update_of = set(of)
+
+    @builder
+    def using(self, table: Selectable | str) -> None:
+        self._using.append(table)
+
+    def _distinct_sql(self, **kwargs: Any) -> str:
+        if self._distinct_on:
+            return "DISTINCT ON({distinct_on}) ".format(
+                distinct_on=",".join(term.get_sql(with_alias=True, **kwargs) for term in self._distinct_on)
+            )
+        return super()._distinct_sql(**kwargs)
+
+    def _for_update_sql(self, **kwargs) -> str:
+        if self._for_update:
+            for_update = ' FOR UPDATE'
+            if self._for_update_of:
+                for_update += f' OF {", ".join([Table(item).get_sql(**kwargs) for item in self._for_update_of])}'
+            if self._for_update_nowait:
+                for_update += ' NOWAIT'
+            elif self._for_update_skip_locked:
+                for_update += ' SKIP LOCKED'
+        else:
+            for_update = ''
+
+        return for_update
 
     @builder
     def returning(self, *terms: Any) -> None:
@@ -661,19 +771,6 @@ class PostgreSQLQueryBuilder(QueryBuilder):
         return " RETURNING {returning}".format(
             returning=",".join(term.get_sql(with_alias=True, **kwargs) for term in self._returns),
         )
-
-    def get_sql(self, with_alias: bool = False, subquery: bool = False, **kwargs: Any) -> str:
-        self._set_kwargs_defaults(kwargs)
-
-        querystring = super().get_sql(with_alias, subquery, **kwargs)
-
-        querystring += self._on_conflict_sql(**kwargs)
-        querystring += self._on_conflict_action_sql(**kwargs)
-
-        if self._returns:
-            kwargs['with_namespace'] = self._update_table and self.from_
-            querystring += self._returning_sql(**kwargs)
-        return querystring
 
 
 class RedshiftQuery(Query):
@@ -952,8 +1049,9 @@ class SQLLiteQuery(Query):
         return SQLLiteQueryBuilder(**kwargs)
 
 
-class SQLLiteQueryBuilder(QueryBuilder):
+class SQLLiteQueryBuilder(ConflictQueryBuilder):
     QUERY_CLS = SQLLiteQuery
+    SUPPORTS_CONSTRAINT_CONFLICT_TARGET = False
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(dialect=Dialects.SQLLITE, wrapper_cls=SQLLiteValueWrapper, **kwargs)

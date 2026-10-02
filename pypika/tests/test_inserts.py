@@ -11,8 +11,8 @@ from pypika import (
 )
 from pypika import Field as F
 from pypika import functions as fn
-from pypika.functions import Avg, Cast
-from pypika.terms import Values
+from pypika.functions import Avg, Cast, Lower
+from pypika.terms import Parameter, Values
 from pypika.utils import QueryException
 
 __author__ = "Timothy Heys"
@@ -463,6 +463,111 @@ class PostgresInsertIntoOnConflictTests(unittest.TestCase):
             'DO UPDATE SET "field"=\'val\' WHERE "abc"."id"=2 AND "abc"."sub_id"=3',
             str(qs),
         )
+
+    def test_on_conflict_expression_target_and_separate_wheres(self):
+        query = (
+            PostgreSQLQuery.into(self.table_abc)
+            .columns("id", "fname", "active")
+            .insert(1, "m", True)
+            .on_conflict(Lower(self.table_abc.fname), where=self.table_abc.active.eq(True))
+            .do_update("fname", "n")
+            .do_update_where(self.table_abc.id.ne(2))
+        )
+
+        self.assertEqual(
+            "INSERT INTO \"abc\" (\"id\",\"fname\",\"active\") VALUES (1,\'m\',true) "
+            'ON CONFLICT (LOWER("fname")) WHERE "active"=true '
+            "DO UPDATE SET \"fname\"=\'n\' WHERE \"abc\".\"id\"<>2",
+            str(query),
+        )
+
+    def test_on_conflict_constraint_target(self):
+        query = PostgreSQLQuery.into(self.table_abc).insert(1).on_conflict(constraint="active_id").do_nothing()
+
+        self.assertEqual(
+            'INSERT INTO "abc" VALUES (1) ON CONFLICT ON CONSTRAINT "active_id" DO NOTHING',
+            str(query),
+        )
+
+    def test_on_conflict_target_and_do_update_wheres_are_order_independent(self):
+        base = PostgreSQLQuery.into(self.table_abc).columns("id", "fname").insert(1, "m")
+        first = (
+            base.on_conflict(Lower(self.table_abc.fname))
+            .on_conflict_where(self.table_abc.active.eq(True))
+            .do_update("fname")
+            .do_update_where(self.table_abc.id.ne(2))
+        )
+        second = (
+            base.on_conflict(Lower(self.table_abc.fname))
+            .do_update("fname")
+            .do_update_where(self.table_abc.id.ne(2))
+            .target_where(self.table_abc.active.eq(True))
+        )
+
+        self.assertEqual(str(first), str(second))
+
+    def test_on_conflict_target_where_renders_parameters(self):
+        query = (
+            PostgreSQLQuery.into(self.table_abc)
+            .insert(1)
+            .on_conflict(self.table_abc.id, where=self.table_abc.active.eq(Parameter(":active")))
+            .do_nothing()
+        )
+
+        self.assertEqual(
+            'INSERT INTO "abc" VALUES (1) ON CONFLICT ("id") WHERE "active"=:active DO NOTHING',
+            query.get_sql(),
+        )
+
+    def test_on_conflict_rejects_index_and_constraint_targets(self):
+        with self.assertRaises(QueryException):
+            PostgreSQLQuery.into(self.table_abc).insert(1).on_conflict("id", constraint="active_id")
+
+    def test_on_conflict_target_where_alias(self):
+        query = (
+            PostgreSQLQuery.into(self.table_abc)
+            .insert(1)
+            .on_conflict("id", target_where=self.table_abc.active.eq(True))
+            .do_nothing()
+        )
+
+        self.assertEqual(
+            'INSERT INTO "abc" VALUES (1) ON CONFLICT ("id") WHERE "active"=true DO NOTHING',
+            str(query),
+        )
+
+    def test_on_conflict_rejects_constraint_target_where(self):
+        with self.assertRaises(QueryException):
+            (
+                PostgreSQLQuery.into(self.table_abc)
+                .insert(1)
+                .on_conflict(constraint="active_id", where=self.table_abc.active.eq(True))
+                .do_nothing()
+            )
+
+    def test_on_conflict_rejects_duplicate_target(self):
+        with self.assertRaises(QueryException):
+            PostgreSQLQuery.into(self.table_abc).insert(1).on_conflict("id").on_conflict("sub_id")
+
+    def test_on_conflict_rejects_do_nothing_with_do_update_where(self):
+        with self.assertRaises(QueryException):
+            (
+                PostgreSQLQuery.into(self.table_abc)
+                .insert(1)
+                .on_conflict("id")
+                .do_update_where(self.table_abc.active.eq(True))
+                .do_nothing()
+            )
+
+    def test_branches_do_not_share_do_update_where(self):
+        base = PostgreSQLQuery.into(self.table_abc).insert(1, "m").on_conflict("id").do_update("fname")
+        first_branch = base.do_update_where(self.table_abc.active.eq(True))
+        second_branch = base.do_update_where(self.table_abc.active.eq(False))
+
+        self.assertIn('"abc"."active"=true', str(first_branch))
+        self.assertNotIn('"abc"."active"=false', str(first_branch))
+        self.assertIn('"abc"."active"=false', str(second_branch))
+        self.assertNotIn('"abc"."active"=true', str(second_branch))
 
 
 class PostgresInsertIntoReturningTests(unittest.TestCase):

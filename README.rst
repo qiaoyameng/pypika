@@ -987,6 +987,26 @@ PostgreSQL
 
     INSERT INTO "customers" VALUES (1,'Jane','Doe','jane@example.com') ON CONFLICT ("email") DO UPDATE SET "email"='bob@example.com'
 
+Partial-index conflict targets can include index expressions and an independent target predicate. The target predicate
+is kept separate from the optional ``DO UPDATE`` predicate.
+
+.. code-block:: python
+
+    from pypika.functions import Lower
+
+    customers = Table('customers')
+
+    q = PostgreSQLQuery.into(customers) \
+        .columns('id', 'email', 'active') \
+        .insert(1, 'jane@example.com', True) \
+        .on_conflict(Lower(customers.email), where=customers.active.eq(True)) \
+        .do_update(customers.email) \
+        .do_update_where(customers.id == 1)
+
+.. code-block:: sql
+
+    INSERT INTO "customers" ("id","email","active") VALUES (1,'jane@example.com',true) ON CONFLICT (LOWER("email")) WHERE "active"=true DO UPDATE SET "email"=EXCLUDED."email" WHERE "customers"."id"=1
+
 
 Insert from a SELECT Sub-query
 """"""""""""""""""""""""""""""
