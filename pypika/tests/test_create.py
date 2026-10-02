@@ -1,8 +1,21 @@
 import unittest
 
-from pypika import Column, Columns, Query, Table, Tables
+from pypika import (
+    Column,
+    Columns,
+    DialectNotSupported,
+    ExcludeElement,
+    Field,
+    InitiallyOption,
+    MySQLQuery,
+    PostgreSQLQuery,
+    Query,
+    QueryException,
+    Table,
+    Tables,
+)
 from pypika.enums import ReferenceOption, SqlTypes
-from pypika.terms import Index, ValueWrapper
+from pypika.terms import Function, Index, ValueWrapper
 
 
 class CreateTableTests(unittest.TestCase):
@@ -175,6 +188,269 @@ class CreateTableTests(unittest.TestCase):
     def test_create_table_as_select_not_query_raises_error(self):
         with self.assertRaises(TypeError):
             Query.create_table(self.new_table).as_select("abc")
+
+
+class CreateTableExcludeTests(unittest.TestCase):
+    def test_exclude_room_equality_and_range_overlap(self):
+        q = (
+            PostgreSQLQuery.create_table("bookings")
+            .columns(
+                Column("id", "INT"),
+                Column("room_id", "INT"),
+                Column("starts_at", "TIMESTAMP"),
+                Column("ends_at", "TIMESTAMP"),
+            )
+            .primary_key("id")
+            .unique("room_id", "starts_at")
+            .foreign_key(["room_id"], Table("rooms"), ["id"])
+            .exclude(
+                "no_double_booking",
+                ExcludeElement("room_id", "="),
+                ExcludeElement(Function("tsrange", Field("starts_at"), Field("ends_at")), "&&"),
+            )
+        )
+
+        self.assertEqual(
+            'CREATE TABLE "bookings" ('
+            '"id" INT,'
+            '"room_id" INT,'
+            '"starts_at" TIMESTAMP,'
+            '"ends_at" TIMESTAMP,'
+            'UNIQUE ("room_id","starts_at"),'
+            'CONSTRAINT "no_double_booking" EXCLUDE USING gist '
+            '("room_id" WITH =,tsrange("starts_at","ends_at") WITH &&),'
+            'PRIMARY KEY ("id"),'
+            'FOREIGN KEY ("room_id") REFERENCES "rooms" ("id"))',
+            str(q),
+        )
+
+    def test_exclude_unnamed_constraint(self):
+        q = (
+            PostgreSQLQuery.create_table("bookings")
+            .columns(Column("room_id", "INT"))
+            .exclude(None, ExcludeElement("room_id", "="))
+        )
+
+        self.assertEqual(
+            'CREATE TABLE "bookings" ("room_id" INT,EXCLUDE USING gist ("room_id" WITH =))',
+            str(q),
+        )
+
+    def test_exclude_multiple_constraints(self):
+        q = (
+            PostgreSQLQuery.create_table("bookings")
+            .columns(Column("room_id", "INT"), Column("desk_id", "INT"))
+            .exclude("room_uniq", ExcludeElement("room_id", "="))
+            .exclude("desk_uniq", ExcludeElement("desk_id", "="), using="spgist")
+        )
+
+        self.assertEqual(
+            'CREATE TABLE "bookings" ('
+            '"room_id" INT,'
+            '"desk_id" INT,'
+            'CONSTRAINT "room_uniq" EXCLUDE USING gist ("room_id" WITH =),'
+            'CONSTRAINT "desk_uniq" EXCLUDE USING spgist ("desk_id" WITH =))',
+            str(q),
+        )
+
+    def test_exclude_with_quoted_names(self):
+        q = (
+            PostgreSQLQuery.create_table("bookings")
+            .columns(Column("booking room", "INT"))
+            .exclude("room uniq", ExcludeElement("booking room", "="))
+        )
+
+        self.assertEqual(
+            'CREATE TABLE "bookings" ("booking room" INT,'
+            'CONSTRAINT "room uniq" EXCLUDE USING gist ("booking room" WITH =))',
+            str(q),
+        )
+
+    def test_exclude_with_predicate(self):
+        with self.subTest("boolean flag predicate"):
+            q = (
+                PostgreSQLQuery.create_table("bookings")
+                .columns(Column("room_id", "INT"), Column("active", "BOOLEAN"))
+                .exclude("active_booking", ExcludeElement("room_id", "="), where=Field("active"))
+            )
+
+            self.assertEqual(
+                'CREATE TABLE "bookings" ('
+                '"room_id" INT,'
+                '"active" BOOLEAN,'
+                'CONSTRAINT "active_booking" EXCLUDE USING gist ("room_id" WITH =) WHERE ("active"))',
+                str(q),
+            )
+
+        with self.subTest("comparison predicate"):
+            q = (
+                PostgreSQLQuery.create_table("bookings")
+                .columns(Column("room_id", "INT"), Column("floor", "INT"))
+                .exclude("room_uniq", ExcludeElement("room_id", "="), where=Field("floor") > 0)
+            )
+
+            self.assertEqual(
+                'CREATE TABLE "bookings" ('
+                '"room_id" INT,'
+                '"floor" INT,'
+                'CONSTRAINT "room_uniq" EXCLUDE USING gist ("room_id" WITH =) WHERE ("floor">0))',
+                str(q),
+            )
+
+    def test_exclude_deferrable_options(self):
+        with self.subTest("deferrable initially deferred"):
+            q = (
+                PostgreSQLQuery.create_table("bookings")
+                .columns(Column("room_id", "INT"))
+                .exclude(
+                    "room_uniq",
+                    ExcludeElement("room_id", "="),
+                    deferrable=True,
+                    initially=InitiallyOption.deferred,
+                )
+            )
+
+            self.assertEqual(
+                'CREATE TABLE "bookings" ('
+                '"room_id" INT,'
+                'CONSTRAINT "room_uniq" EXCLUDE USING gist ("room_id" WITH =) DEFERRABLE INITIALLY DEFERRED)',
+                str(q),
+            )
+
+        with self.subTest("not deferrable initially immediate"):
+            q = (
+                PostgreSQLQuery.create_table("bookings")
+                .columns(Column("room_id", "INT"))
+                .exclude(
+                    "room_uniq",
+                    ExcludeElement("room_id", "="),
+                    deferrable=False,
+                    initially=InitiallyOption.immediate,
+                )
+            )
+
+            self.assertEqual(
+                'CREATE TABLE "bookings" ('
+                '"room_id" INT,'
+                'CONSTRAINT "room_uniq" EXCLUDE USING gist ("room_id" WITH =) NOT DEFERRABLE INITIALLY IMMEDIATE)',
+                str(q),
+            )
+
+    def test_exclude_initially_deferred_requires_deferrable(self):
+        with self.subTest("not deferrable"):
+            with self.assertRaises(QueryException):
+                PostgreSQLQuery.create_table("bookings").columns(Column("room_id", "INT")).exclude(
+                    "room_uniq",
+                    ExcludeElement("room_id", "="),
+                    deferrable=False,
+                    initially=InitiallyOption.deferred,
+                )
+
+        with self.subTest("deferrable unspecified"):
+            with self.assertRaises(QueryException):
+                PostgreSQLQuery.create_table("bookings").columns(Column("room_id", "INT")).exclude(
+                    "room_uniq",
+                    ExcludeElement("room_id", "="),
+                    initially=InitiallyOption.deferred,
+                )
+
+    def test_exclude_duplicate_name_raises_error(self):
+        with self.assertRaises(QueryException):
+            (
+                PostgreSQLQuery.create_table("bookings")
+                .columns(Column("room_id", "INT"), Column("desk_id", "INT"))
+                .exclude("room_uniq", ExcludeElement("room_id", "="))
+                .exclude("room_uniq", ExcludeElement("desk_id", "="))
+            )
+
+    def test_exclude_unknown_column_raises_error(self):
+        with self.subTest("in element"):
+            with self.assertRaises(QueryException):
+                PostgreSQLQuery.create_table("bookings").columns(Column("room_id", "INT")).exclude(
+                    "room_uniq", ExcludeElement("missing", "=")
+                )
+
+        with self.subTest("in function expression"):
+            with self.assertRaises(QueryException):
+                PostgreSQLQuery.create_table("bookings").columns(Column("room_id", "INT")).exclude(
+                    "room_uniq", ExcludeElement(Function("tsrange", Field("starts_at"), Field("ends_at")), "&&")
+                )
+
+        with self.subTest("in predicate"):
+            with self.assertRaises(QueryException):
+                PostgreSQLQuery.create_table("bookings").columns(Column("room_id", "INT")).exclude(
+                    "room_uniq", ExcludeElement("room_id", "="), where=Field("active")
+                )
+
+    def test_exclude_requires_elements(self):
+        with self.assertRaises(QueryException):
+            PostgreSQLQuery.create_table("bookings").columns(Column("room_id", "INT")).exclude("room_uniq")
+
+    def test_exclude_invalid_arguments_raise_error(self):
+        with self.subTest("non-term expression"):
+            with self.assertRaises(TypeError):
+                ExcludeElement(42, "=")
+
+        with self.subTest("empty operator"):
+            with self.assertRaises(ValueError):
+                ExcludeElement("room_id", " ")
+
+        with self.subTest("empty using"):
+            with self.assertRaises(ValueError):
+                PostgreSQLQuery.create_table("bookings").columns(Column("room_id", "INT")).exclude(
+                    "room_uniq", ExcludeElement("room_id", "="), using=""
+                )
+
+        with self.subTest("non-criterion predicate"):
+            with self.assertRaises(TypeError):
+                PostgreSQLQuery.create_table("bookings").columns(Column("room_id", "INT")).exclude(
+                    "room_uniq", ExcludeElement("room_id", "="), where="active"
+                )
+
+        with self.subTest("non-enum initially"):
+            with self.assertRaises(TypeError):
+                PostgreSQLQuery.create_table("bookings").columns(Column("room_id", "INT")).exclude(
+                    "room_uniq", ExcludeElement("room_id", "="), deferrable=True, initially="INITIALLY DEFERRED"
+                )
+
+    def test_exclude_unsupported_dialects_raise_error(self):
+        with self.subTest("ansi"):
+            q = Query.create_table("bookings").columns(Column("room_id", "INT")).exclude(
+                "room_uniq", ExcludeElement("room_id", "=")
+            )
+            with self.assertRaises(DialectNotSupported):
+                q.get_sql()
+
+        with self.subTest("mysql"):
+            q = MySQLQuery.create_table("bookings").columns(Column("room_id", "INT")).exclude(
+                "room_uniq", ExcludeElement("room_id", "=")
+            )
+            with self.assertRaises(DialectNotSupported):
+                q.get_sql()
+
+    def test_derived_builders_do_not_share_mutable_lists(self):
+        base = PostgreSQLQuery.create_table("bookings").columns(Column("room_id", "INT"), Column("desk_id", "INT"))
+        q1 = base.exclude("room_uniq", ExcludeElement("room_id", "="))
+        q2 = base.exclude("desk_uniq", ExcludeElement("desk_id", "="))
+
+        self.assertEqual('CREATE TABLE "bookings" ("room_id" INT,"desk_id" INT)', str(base))
+        self.assertEqual(
+            'CREATE TABLE "bookings" ("room_id" INT,"desk_id" INT,'
+            'CONSTRAINT "room_uniq" EXCLUDE USING gist ("room_id" WITH =))',
+            str(q1),
+        )
+        self.assertEqual(
+            'CREATE TABLE "bookings" ("room_id" INT,"desk_id" INT,'
+            'CONSTRAINT "desk_uniq" EXCLUDE USING gist ("desk_id" WITH =))',
+            str(q2),
+        )
+
+    def test_derived_builders_do_not_share_column_lists(self):
+        base = PostgreSQLQuery.create_table("bookings").columns(Column("room_id", "INT"))
+        derived = base.columns(Column("desk_id", "INT"))
+
+        self.assertEqual('CREATE TABLE "bookings" ("room_id" INT)', str(base))
+        self.assertEqual('CREATE TABLE "bookings" ("room_id" INT,"desk_id" INT)', str(derived))
 
 
 class CreateIndexTests(unittest.TestCase):

@@ -61,6 +61,7 @@ from pypika.dialects import (
 # noinspection PyUnresolvedReferences
 from pypika.enums import (
     DatePart,
+    InitiallyOption,
     JoinType,
     Order,
 )
@@ -70,6 +71,8 @@ from pypika.queries import (
     AliasedQuery,
     Column,
     Database,
+    ExcludeConstraint,
+    ExcludeElement,
     Query,
     Schema,
     Table,
@@ -109,6 +112,7 @@ from pypika.terms import (
 # noinspection PyUnresolvedReferences
 from pypika.utils import (
     CaseException,
+    DialectNotSupported,
     FunctionException,
     GroupingException,
     JoinException,
@@ -136,6 +140,7 @@ __all__ = (
     'SQLLiteQuery',
     'VerticaQuery',
     'DatePart',
+    'InitiallyOption',
     'JoinType',
     'Order',
     'AliasedQuery',
@@ -144,6 +149,8 @@ __all__ = (
     'Table',
     'Column',
     'Database',
+    'ExcludeConstraint',
+    'ExcludeElement',
     'Tables',
     'Columns',
     'Array',
@@ -168,6 +175,7 @@ __all__ = (
     'Tuple',
     'CustomFunction',
     'CaseException',
+    'DialectNotSupported',
     'GroupingException',
     'JiraQuery',
     'JoinException',

@@ -6,7 +6,7 @@ from copy import copy
 from functools import reduce
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
-from pypika.enums import Dialects, JoinType, ReferenceOption, SetOperation
+from pypika.enums import Dialects, InitiallyOption, JoinType, ReferenceOption, SetOperation
 from pypika.terms import (
     ArithmeticExpression,
     Criterion,
@@ -23,6 +23,7 @@ from pypika.terms import (
     ValueWrapper,
 )
 from pypika.utils import (
+    DialectNotSupported,
     JoinException,
     QueryException,
     RollupException,
@@ -348,6 +349,101 @@ class PeriodFor:
         )
 
         return period_for_sql
+
+
+class ExcludeElement:
+    """
+    Represents a single ``expression WITH operator`` item of an EXCLUDE constraint.
+    """
+
+    def __init__(self, expression: Term | str, operator: str) -> None:
+        if isinstance(expression, str):
+            expression = Field(expression)
+        if not isinstance(expression, Term):
+            raise TypeError("Expected 'expression' to be an instance of Term or str")
+        if not isinstance(operator, str) or not operator.strip():
+            raise ValueError("Expected 'operator' to be a non-empty string")
+        self.expression = expression
+        self.operator = operator
+
+    def fields_(self) -> set[Field]:
+        return self.expression.fields_()
+
+    def get_sql(self, **kwargs: Any) -> str:
+        return "{expression} WITH {operator}".format(
+            expression=self.expression.get_sql(**kwargs),
+            operator=self.operator,
+        )
+
+    def __str__(self) -> str:
+        return self.get_sql(quote_char='"')
+
+
+class ExcludeConstraint:
+    """
+    Represents an EXCLUDE constraint, e.g. PostgreSQL's
+    ``CONSTRAINT name EXCLUDE USING gist (expression WITH operator, ...) WHERE (predicate)``.
+    """
+
+    def __init__(
+        self,
+        name: str | None = None,
+        elements: Sequence[ExcludeElement] | None = None,
+        using: str = "gist",
+        where: Criterion | None = None,
+        deferrable: bool | None = None,
+        initially: InitiallyOption | None = None,
+    ) -> None:
+        elements = list(elements) if elements else []
+        if not elements:
+            raise QueryException("EXCLUDE constraint requires at least one element")
+        for element in elements:
+            if not isinstance(element, ExcludeElement):
+                raise TypeError("Expected 'elements' to contain ExcludeElement instances")
+        if not isinstance(using, str) or not using.strip():
+            raise ValueError("Expected 'using' to be a non-empty string")
+        if where is not None and not isinstance(where, Criterion):
+            raise TypeError("Expected 'where' to be an instance of Criterion")
+        if initially is not None and not isinstance(initially, InitiallyOption):
+            raise TypeError("Expected 'initially' to be an instance of InitiallyOption")
+        if initially is InitiallyOption.deferred and deferrable is not True:
+            raise QueryException("INITIALLY DEFERRED requires the constraint to be DEFERRABLE")
+        self.name = name
+        self.elements = elements
+        self.using = using
+        self.where = where
+        self.deferrable = deferrable
+        self.initially = initially
+
+    def fields_(self) -> set[Field]:
+        fields: set[Field] = set()
+        for element in self.elements:
+            fields |= element.fields_()
+        if self.where is not None:
+            fields |= self.where.fields_()
+        return fields
+
+    def get_sql(self, **kwargs: Any) -> str:
+        quote_char = kwargs.get("quote_char")
+
+        constraint_sql = ""
+        if self.name:
+            constraint_sql += "CONSTRAINT {name} ".format(name=format_quotes(self.name, quote_char))
+        constraint_sql += "EXCLUDE USING {using} ({elements})".format(
+            using=self.using,
+            elements=",".join(element.get_sql(**kwargs) for element in self.elements),
+        )
+        if self.where is not None:
+            constraint_sql += " WHERE ({where})".format(where=self.where.get_sql(**kwargs))
+        if self.deferrable is not None:
+            constraint_sql += " DEFERRABLE" if self.deferrable else " NOT DEFERRABLE"
+        if self.initially is not None:
+            constraint_sql += " " + self.initially.value
+
+        return constraint_sql
+
+    def __str__(self) -> str:
+        return self.get_sql(quote_char='"')
 
 
 # for typing in Query's methods
@@ -1798,6 +1894,7 @@ class CreateQueryBuilder:
         self._with_system_versioning = False
         self._primary_key = None
         self._uniques = []
+        self._excludes = []
         self._if_not_exists = False
         self.dialect = dialect
         self._foreign_key = None
@@ -1805,6 +1902,15 @@ class CreateQueryBuilder:
         self._foreign_key_reference = None
         self._foreign_key_on_update: ReferenceOption = None
         self._foreign_key_on_delete: ReferenceOption = None
+
+    def __copy__(self) -> CreateQueryBuilder:
+        newone = type(self).__new__(type(self))
+        newone.__dict__.update(self.__dict__)
+        newone._columns = copy(self._columns)
+        newone._period_fors = copy(self._period_fors)
+        newone._uniques = copy(self._uniques)
+        newone._excludes = copy(self._excludes)
+        return newone
 
     def _set_kwargs_defaults(self, kwargs: dict) -> None:
         kwargs.setdefault("quote_char", self.QUOTE_CHAR)
@@ -1939,6 +2045,72 @@ class CreateQueryBuilder:
         if self._primary_key:
             raise AttributeError("'Query' object already has attribute primary_key")
         self._primary_key = self._prepare_columns_input(columns)
+
+    @builder
+    def exclude(
+        self,
+        name: str | None = None,
+        *elements: ExcludeElement,
+        using: str = "gist",
+        where: Criterion | None = None,
+        deferrable: bool | None = None,
+        initially: InitiallyOption | None = None,
+    ) -> None:
+        """
+        Adds an EXCLUDE constraint, e.g. PostgreSQL's
+        ``CONSTRAINT name EXCLUDE USING gist (expression WITH operator, ...)``.
+
+        :param name:
+            An optional name for the constraint.
+
+        :param elements:
+            Type: ExcludeElement
+
+            One or more ``expression WITH operator`` items.
+
+        :param using:
+            The index method, defaults to "gist".
+
+        :param where:
+            An optional predicate for a partial constraint.
+
+        :param deferrable:
+            Whether the constraint is DEFERRABLE (True) or NOT DEFERRABLE (False).
+
+        :param initially:
+            Type: InitiallyOption
+
+            An optional INITIALLY DEFERRED/IMMEDIATE rule.
+
+        :raises QueryException:
+            If the constraint name is already used or an element references a column
+            that is not part of the table.
+
+        :return:
+            CreateQueryBuilder.
+        """
+        constraint = ExcludeConstraint(
+            name=name,
+            elements=list(elements),
+            using=using,
+            where=where,
+            deferrable=deferrable,
+            initially=initially,
+        )
+
+        if name is not None and any(existing.name == name for existing in self._excludes):
+            raise QueryException("Duplicate EXCLUDE constraint name '{name}'".format(name=name))
+
+        column_names = {column.name for column in self._columns}
+        unknown_columns = {field.name for field in constraint.fields_()} - column_names
+        if unknown_columns:
+            raise QueryException(
+                "EXCLUDE constraint references unknown columns: {columns}".format(
+                    columns=",".join(sorted(unknown_columns))
+                )
+            )
+
+        self._excludes.append(constraint)
 
     @builder
     def foreign_key(
@@ -2079,6 +2251,11 @@ class CreateQueryBuilder:
             for unique in self._uniques
         ]
 
+    def _exclude_clauses(self, **kwargs) -> list[str]:
+        if self._excludes:
+            raise DialectNotSupported("EXCLUDE constraints are not supported for this dialect")
+        return []
+
     def _primary_key_clause(self, **kwargs) -> str:
         return "PRIMARY KEY ({columns})".format(
             columns=",".join(column.get_name_sql(**kwargs) for column in self._primary_key)
@@ -2101,6 +2278,7 @@ class CreateQueryBuilder:
         clauses = self._column_clauses(**kwargs)
         clauses += self._period_for_clauses(**kwargs)
         clauses += self._unique_key_clauses(**kwargs)
+        clauses += self._exclude_clauses(**kwargs)
 
         if self._primary_key:
             clauses.append(self._primary_key_clause(**kwargs))

@@ -414,6 +414,20 @@ class PostgreSQLQuery(Query):
     def _builder(cls, **kwargs) -> PostgreSQLQueryBuilder:
         return PostgreSQLQueryBuilder(**kwargs)
 
+    @classmethod
+    def create_table(cls, table: str | Table) -> PostgreSQLCreateQueryBuilder:
+        return PostgreSQLCreateQueryBuilder().create_table(table)
+
+
+class PostgreSQLCreateQueryBuilder(CreateQueryBuilder):
+    QUERY_CLS = PostgreSQLQuery
+
+    def __init__(self) -> None:
+        super().__init__(dialect=Dialects.POSTGRESQL)
+
+    def _exclude_clauses(self, **kwargs: Any) -> list[str]:
+        return [exclude.get_sql(**kwargs) for exclude in self._excludes]
+
 
 class PostgreSQLQueryBuilder(QueryBuilder):
     ALIAS_QUOTE_CHAR = '"'

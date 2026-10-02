@@ -1480,6 +1480,74 @@ TEMPORARY and UNLOGGED tables can also be created:
 
     CREATE UNLOGGED TABLE "fast_items" ("id" INT,"name" VARCHAR(100))
 
+PostgreSQL EXCLUDE Constraints
+""""""""""""""""""""""""""""""
+
+PostgreSQL supports ``EXCLUDE`` constraints, which are commonly used to prevent overlapping time ranges for the
+same entity (e.g. double-booking a room). Use ``pypika.PostgreSQLQuery.create_table`` together with
+``pypika.ExcludeElement`` to declare named constraints made of one or more ``expression WITH operator`` items.
+An optional ``WHERE`` predicate as well as ``DEFERRABLE``/``INITIALLY`` rules are supported.
+
+.. code-block:: python
+
+    from pypika import Column, ExcludeElement, Field, PostgreSQLQuery
+    from pypika.terms import Function
+
+    stmt = PostgreSQLQuery \
+        .create_table("bookings") \
+        .columns(
+            Column("id", "INT"),
+            Column("room_id", "INT"),
+            Column("starts_at", "TIMESTAMP"),
+            Column("ends_at", "TIMESTAMP")) \
+        .primary_key("id") \
+        .exclude(
+            "no_double_booking",
+            ExcludeElement("room_id", "="),
+            ExcludeElement(Function("tsrange", Field("starts_at"), Field("ends_at")), "&&"))
+
+This produces:
+
+.. code-block:: sql
+
+    CREATE TABLE "bookings" (
+        "id" INT,
+        "room_id" INT,
+        "starts_at" TIMESTAMP,
+        "ends_at" TIMESTAMP,
+        CONSTRAINT "no_double_booking" EXCLUDE USING gist ("room_id" WITH =,tsrange("starts_at","ends_at") WITH &&),
+        PRIMARY KEY ("id")
+    )
+
+A partial constraint can be declared with the ``where`` argument, and deferrability with ``deferrable`` and
+``initially``:
+
+.. code-block:: python
+
+    from pypika import InitiallyOption
+
+    stmt = PostgreSQLQuery \
+        .create_table("bookings") \
+        .columns(Column("room_id", "INT"), Column("active", "BOOLEAN")) \
+        .exclude(
+            "active_booking",
+            ExcludeElement("room_id", "="),
+            where=Field("active"),
+            deferrable=True,
+            initially=InitiallyOption.deferred)
+
+.. code-block:: sql
+
+    CREATE TABLE "bookings" (
+        "room_id" INT,
+        "active" BOOLEAN,
+        CONSTRAINT "active_booking" EXCLUDE USING gist ("room_id" WITH =) WHERE ("active") DEFERRABLE INITIALLY DEFERRED
+    )
+
+Constraint elements are validated against the columns of the table, constraint names must be unique, and
+``INITIALLY DEFERRED`` requires the constraint to be ``DEFERRABLE``. Dialects other than PostgreSQL refuse to
+generate ``EXCLUDE`` constraints.
+
 Managing Table Indices
 ^^^^^^^^^^^^^^^^^^^^^^
 

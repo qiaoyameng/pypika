@@ -75,6 +75,11 @@ class ReferenceOption(Enum):
     set_default = "SET DEFAULT"
 
 
+class InitiallyOption(Enum):
+    deferred = "INITIALLY DEFERRED"
+    immediate = "INITIALLY IMMEDIATE"
+
+
 class SetOperation(Enum):
     union = "UNION"
     union_all = "UNION ALL"
