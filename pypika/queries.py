@@ -15,6 +15,7 @@ from pypika.terms import (
     Function,
     Index,
     Node,
+    NullValue,
     PeriodCriterion,
     Rollup,
     Star,
@@ -250,6 +251,101 @@ class Table(Selectable):
         :return: QueryBuilder
         """
         return self._query_cls.into(self).insert(*terms)
+
+
+class Values(Selectable):
+    def __init__(
+        self,
+        rows: Sequence[Sequence[Any]],
+        columns: Sequence[str] | None = None,
+        alias: str | None = None,
+    ) -> None:
+        super().__init__(alias)
+        if isinstance(columns, str):
+            columns = (columns,)
+        self.columns = tuple(columns) if columns is not None else ()
+        self.rows = self._validate_rows(rows)
+
+    def _validate_rows(self, rows: Sequence[Sequence[Any]]) -> list[list[Any]]:
+        validated_rows = [list(row) for row in rows]
+        width = len(self.columns) if self.columns else (len(validated_rows[0]) if validated_rows else 0)
+
+        if width == 0:
+            raise QueryException("VALUES requires at least one column.")
+
+        if not validated_rows and not self.columns:
+            raise QueryException("Columns are required for an empty VALUES relation.")
+
+        for row_number, row in enumerate(validated_rows):
+            if len(row) != width:
+                raise QueryException(
+                    "VALUES row {row_number} has {actual} values, expected {expected}.".format(
+                        row_number=row_number,
+                        actual=len(row),
+                        expected=width,
+                    )
+                )
+
+        return validated_rows
+
+    def __copy__(self) -> Values:
+        newone = type(self).__new__(type(self))
+        newone.__dict__.update(self.__dict__)
+        newone.columns = copy(self.columns)
+        newone.rows = [copy(row) for row in self.rows]
+        return newone
+
+    @builder
+    def replace_table(self, current_table: Selectable | None, new_table: Selectable | None) -> Selectable:
+        if self == current_table:
+            return new_table
+
+        self.rows = [
+            [value.replace_table(current_table, new_table) if isinstance(value, Node) else value for value in row]
+            for row in self.rows
+        ]
+
+    def get_sql(self, with_alias: bool = False, subquery: bool = False, **kwargs: Any) -> str:
+        if with_alias and self.alias is None:
+            raise QueryException("VALUES requires an alias when used in FROM or JOIN.")
+
+        if subquery and kwargs.get("dialect") == Dialects.SQLLITE:
+            raise QueryException("VALUES in FROM or JOIN is only supported for PostgreSQL. Use a CTE for SQLite.")
+
+        if self.rows:
+            values_sql = "VALUES {rows}".format(rows=",".join(self._row_sql(row, **kwargs) for row in self.rows))
+        else:
+            values_sql = self._empty_sql(**kwargs)
+
+        if subquery:
+            values_sql = "({values})".format(values=values_sql)
+
+        if with_alias:
+            values_sql = format_alias_sql(values_sql, self.alias, **kwargs)
+            if self.columns:
+                values_sql += self._columns_sql(**kwargs)
+
+        return values_sql
+
+    def _row_sql(self, row: Sequence[Any], **kwargs: Any) -> str:
+        wrapper_cls = kwargs.pop("wrapper_cls", ValueWrapper)
+        terms = [Term.wrap_constant(value, wrapper_cls=wrapper_cls) for value in row]
+        return "({values})".format(values=",".join(term.get_sql(**kwargs) for term in terms))
+
+    def _empty_sql(self, **kwargs: Any) -> str:
+        dialect = kwargs.get("dialect")
+        if dialect == Dialects.POSTGRESQL:
+            false_sql = "FALSE"
+        elif dialect == Dialects.SQLLITE:
+            false_sql = "0"
+        else:
+            raise QueryException("Empty VALUES requires a supported dialect to generate a dialect-specific relation.")
+
+        nulls = ",".join(NullValue().get_sql(**kwargs) for _ in self.columns)
+        return "SELECT {nulls} WHERE {false_sql}".format(nulls=nulls, false_sql=false_sql)
+
+    def _columns_sql(self, quote_char: str | None = None, **kwargs: Any) -> str:
+        return "({columns})".format(columns=",".join(format_quotes(column, quote_char) for column in self.columns))
 
 
 def make_tables(*names: tuple[str, str] | str, **kwargs: Any) -> list[Table]:
@@ -1263,6 +1359,7 @@ class QueryBuilder(Selectable, Term):
         kwargs.setdefault("alias_quote_char", self.ALIAS_QUOTE_CHAR)
         kwargs.setdefault("as_keyword", self.as_keyword)
         kwargs.setdefault("dialect", self.dialect)
+        kwargs.setdefault("wrapper_cls", self._wrapper_cls)
 
     def get_sql(self, with_alias: bool = False, subquery: bool = False, **kwargs: Any) -> str:
         self._set_kwargs_defaults(kwargs)
@@ -1399,10 +1496,23 @@ class QueryBuilder(Selectable, Term):
         return querystring
 
     def _with_sql(self, **kwargs: Any) -> str:
-        return "WITH " + ",".join(
-            clause.name + " AS (" + clause.get_sql(subquery=False, with_alias=False, **kwargs) + ") "
-            for clause in self._with
-        )
+        clauses = []
+        for clause in self._with:
+            column_sql = ""
+            if isinstance(clause.query, Values) and clause.query.columns:
+                column_sql = "({columns})".format(
+                    columns=",".join(format_quotes(column, kwargs.get("quote_char")) for column in clause.query.columns)
+                )
+
+            clauses.append(
+                clause.name
+                + column_sql
+                + " AS ("
+                + clause.get_sql(subquery=False, with_alias=False, **kwargs)
+                + ") "
+            )
+
+        return "WITH " + ",".join(clauses)
 
     def _distinct_sql(self, **kwargs: Any) -> str:
         distinct = 'DISTINCT ' if self._distinct else ''
