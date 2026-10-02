@@ -1173,7 +1173,8 @@ These analytic functions take one or more arguments with window partitioning.
 Window Frames
 """""""""""""
 
-Functions which use window aggregation expose the ``rows()`` and ``range()`` methods to define the window frame.
+Functions which use window aggregation expose the ``rows()``, ``range()`` and ``groups()`` methods to define the
+window frame.
 Boundaries can be set using ``an.CURRENT_ROW``, ``an.Preceding(n)``, or ``an.Following(n)``.
 Unbounded ranges use ``an.Preceding()`` or ``an.Following()`` without arguments.
 
@@ -1189,6 +1190,28 @@ Unbounded ranges use ``an.Preceding()`` or ``an.Following()`` without arguments.
 .. code-block:: sql
 
     SELECT "date","amount",SUM("amount") OVER(PARTITION BY "account_id" ORDER BY "date" ROWS BETWEEN 7 PRECEDING AND CURRENT ROW) "rolling_7_day" FROM "transactions"
+
+``GROUPS`` frames move the window by peer groups (rows sharing the same ``ORDER BY`` value) instead of individual
+rows. The ``exclude()`` method adds an ``EXCLUDE`` clause using ``FrameExclusion.CURRENT_ROW``, ``FrameExclusion.GROUP``,
+``FrameExclusion.TIES`` or ``FrameExclusion.NO_OTHERS``.
+
+.. code-block:: python
+
+    from pypika import FrameExclusion, Query, Table, analytics as an
+
+    t = Table('transactions')
+    peer_sum = an.Sum(t.amount).orderby(t.date).groups(an.Preceding(1), an.Following(1)).exclude(FrameExclusion.TIES)
+
+    q = Query.from_(t).select(t.date, t.amount, peer_sum.as_('peer_sum'))
+
+.. code-block:: sql
+
+    SELECT "date","amount",SUM("amount") OVER(ORDER BY "date" GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE TIES) "peer_sum" FROM "transactions"
+
+Frame boundaries are validated when the frame is defined: negative offsets are rejected, the frame start must not
+come after the frame end, and a frame or exclusion can only be set once. ``GROUPS`` frames and the ``EXCLUDE`` clause
+are only rendered for dialects that support them (PostgreSQL and SQLite); other dialects raise
+``DialectNotSupported`` when the SQL is generated.
 
 
 Parametrized Queries

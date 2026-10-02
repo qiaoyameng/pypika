@@ -17,9 +17,17 @@ __email__ = "theys@kayak.com"
 class Preceding(WindowFrameAnalyticFunction.Edge):
     modifier = "PRECEDING"
 
+    @property
+    def order(self):
+        return 0 if self.is_unbounded else 1
+
 
 class Following(WindowFrameAnalyticFunction.Edge):
     modifier = "FOLLOWING"
+
+    @property
+    def order(self):
+        return 4 if self.is_unbounded else 3
 
 
 CURRENT_ROW = "CURRENT ROW"

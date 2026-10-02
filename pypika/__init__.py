@@ -61,6 +61,7 @@ from pypika.dialects import (
 # noinspection PyUnresolvedReferences
 from pypika.enums import (
     DatePart,
+    FrameExclusion,
     JoinType,
     Order,
 )
@@ -136,6 +137,7 @@ __all__ = (
     'SQLLiteQuery',
     'VerticaQuery',
     'DatePart',
+    'FrameExclusion',
     'JoinType',
     'Order',
     'AliasedQuery',

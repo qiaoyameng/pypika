@@ -9,10 +9,22 @@ from datetime import date, datetime, time
 from enum import Enum
 from typing import TYPE_CHECKING, Any, TypeVar, overload
 
-from pypika.enums import Arithmetic, Boolean, Comparator, Dialects, Equality, JSONOperators, Matching, Order
+from pypika.enums import (
+    Arithmetic,
+    Boolean,
+    Comparator,
+    Dialects,
+    Equality,
+    FrameExclusion,
+    JSONOperators,
+    Matching,
+    Order,
+)
 from pypika.utils import (
     CaseException,
+    DialectNotSupported,
     FunctionException,
+    QueryException,
     builder,
     format_alias_sql,
     format_quotes,
@@ -1575,24 +1587,90 @@ EdgeT = TypeVar("EdgeT", bound="WindowFrameAnalyticFunction.Edge")
 
 
 class WindowFrameAnalyticFunction(AnalyticFunction):
+    # Dialects known to support GROUPS frames and the EXCLUDE clause. When no
+    # dialect is specified the generic SQL is emitted without a support check.
+    GROUPS_FRAME_DIALECTS = (Dialects.POSTGRESQL, Dialects.SQLLITE)
+    EXCLUDE_DIALECTS = (Dialects.POSTGRESQL, Dialects.SQLLITE)
+
     class Edge:
+        modifier = ""
+        order = 0
+
         def __init__(self, value: str | int | None = None) -> None:
+            if value is not None:
+                if isinstance(value, bool) or not isinstance(value, (int, str)):
+                    raise TypeError(
+                        "Window frame offsets must be integers, got {value!r}".format(value=value)
+                    )
+                if isinstance(value, int) and value < 0:
+                    raise ValueError(
+                        "Window frame offsets cannot be negative, got {value}".format(value=value)
+                    )
+                if isinstance(value, str) and value.strip().startswith("-"):
+                    raise ValueError(
+                        "Window frame offsets cannot be negative, got {value!r}".format(value=value)
+                    )
             self.value = value
+
+        @property
+        def is_unbounded(self) -> bool:
+            return self.value is None
 
         def __str__(self) -> str:
             return "{value} {modifier}".format(
-                value=self.value or "UNBOUNDED",
+                value="UNBOUNDED" if self.value is None else self.value,
                 modifier=self.modifier,
             )
+
+    class CurrentRow(Edge):
+        order = 2
+
+        def __init__(self, value: str | int | None = None) -> None:
+            if value is not None:
+                raise ValueError("CURRENT ROW does not accept an offset")
+            super().__init__(None)
+
+        def __str__(self) -> str:
+            return "CURRENT ROW"
 
     def __init__(self, name: str, *args: Any, **kwargs: Any) -> None:
         super().__init__(name, *args, **kwargs)
         self.frame = None
         self.bound = None
+        self.exclusion = None
 
-    def _set_frame_and_bounds(self, frame: str, bound: str, and_bound: EdgeT | None) -> None:
+    @staticmethod
+    def _normalize_edge(bound: str | EdgeT) -> EdgeT:
+        if isinstance(bound, WindowFrameAnalyticFunction.Edge):
+            return bound
+        if isinstance(bound, str) and bound.upper() == "CURRENT ROW":
+            return WindowFrameAnalyticFunction.CurrentRow()
+        raise TypeError(
+            "Window frame bounds must be Edge instances (e.g. Preceding, Following, CURRENT_ROW); "
+            "raw SQL strings are not accepted. Got: {bound!r}".format(bound=bound)
+        )
+
+    @staticmethod
+    def _validate_bound_order(lower: EdgeT, upper: EdgeT) -> None:
+        if lower.modifier == "FOLLOWING" and lower.is_unbounded:
+            raise ValueError("Window frame start cannot be UNBOUNDED FOLLOWING")
+        if upper.modifier == "PRECEDING" and upper.is_unbounded:
+            raise ValueError("Window frame end cannot be UNBOUNDED PRECEDING")
+        if lower.order > upper.order:
+            raise ValueError(
+                "Window frame start must not come after the frame end, got BETWEEN {lower} AND {upper}".format(
+                    lower=lower, upper=upper
+                )
+            )
+
+    def _set_frame_and_bounds(self, frame: str, bound: str | EdgeT, and_bound: EdgeT | None) -> None:
         if self.frame or self.bound:
             raise AttributeError()
+
+        bound = self._normalize_edge(bound)
+        and_bound = self._normalize_edge(and_bound) if and_bound is not None else None
+        if and_bound is not None:
+            self._validate_bound_order(bound, and_bound)
 
         self.frame = frame
         self.bound = (bound, and_bound) if and_bound else bound
@@ -1605,24 +1683,69 @@ class WindowFrameAnalyticFunction(AnalyticFunction):
     def range(self, bound: str | EdgeT, and_bound: EdgeT | None = None) -> None:
         self._set_frame_and_bounds("RANGE", bound, and_bound)
 
-    def get_frame_sql(self) -> str:
-        if not isinstance(self.bound, tuple):
-            return "{frame} {bound}".format(frame=self.frame, bound=self.bound)
+    @builder
+    def groups(self, bound: str | EdgeT, and_bound: EdgeT | None = None) -> None:
+        self._set_frame_and_bounds("GROUPS", bound, and_bound)
 
-        lower, upper = self.bound
-        return "{frame} BETWEEN {lower} AND {upper}".format(
-            frame=self.frame,
-            lower=lower,
-            upper=upper,
+    @builder
+    def exclude(self, exclusion: FrameExclusion | str) -> None:
+        if self.exclusion is not None:
+            raise AttributeError()
+        self.exclusion = self._normalize_exclusion(exclusion)
+
+    @staticmethod
+    def _normalize_exclusion(exclusion: FrameExclusion | str) -> FrameExclusion:
+        if isinstance(exclusion, FrameExclusion):
+            return exclusion
+        if isinstance(exclusion, str):
+            for candidate in FrameExclusion:
+                if exclusion.upper() in (candidate.value, candidate.name):
+                    return candidate
+        raise ValueError(
+            "Unknown window frame exclusion {exclusion!r}; expected one of {options}".format(
+                exclusion=exclusion,
+                options=", ".join(e.value for e in FrameExclusion),
+            )
         )
+
+    @staticmethod
+    def _require_dialect_support(dialect: Dialects | None, supported: tuple, feature: str) -> None:
+        if dialect is not None and dialect not in supported:
+            name = dialect.value if isinstance(dialect, Dialects) else str(dialect)
+            raise DialectNotSupported(
+                "{feature} is not supported by the {dialect} dialect".format(feature=feature, dialect=name)
+            )
+
+    def get_frame_sql(self, **kwargs: Any) -> str:
+        dialect = kwargs.get("dialect")
+        if self.frame == "GROUPS":
+            self._require_dialect_support(dialect, self.GROUPS_FRAME_DIALECTS, "GROUPS window frames")
+
+        if not isinstance(self.bound, tuple):
+            frame_sql = "{frame} {bound}".format(frame=self.frame, bound=self.bound)
+        else:
+            lower, upper = self.bound
+            frame_sql = "{frame} BETWEEN {lower} AND {upper}".format(
+                frame=self.frame,
+                lower=lower,
+                upper=upper,
+            )
+
+        if self.exclusion is not None:
+            self._require_dialect_support(dialect, self.EXCLUDE_DIALECTS, "The EXCLUDE clause")
+            frame_sql += " EXCLUDE {exclusion}".format(exclusion=self.exclusion.value)
+
+        return frame_sql
 
     def get_partition_sql(self, **kwargs: Any) -> str:
         partition_sql = super().get_partition_sql(**kwargs)
 
         if not self.frame and not self.bound:
+            if self.exclusion is not None:
+                raise QueryException("The EXCLUDE clause requires a window frame (rows, range or groups)")
             return partition_sql
 
-        return "{over} {frame}".format(over=partition_sql, frame=self.get_frame_sql())
+        return "{over} {frame}".format(over=partition_sql, frame=self.get_frame_sql(**kwargs))
 
 
 class IgnoreNullsAnalyticFunction(AnalyticFunction):

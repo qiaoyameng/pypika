@@ -149,6 +149,13 @@ class Dialects(Enum):
     SNOWFLAKE = "snowflake"
 
 
+class FrameExclusion(Enum):
+    CURRENT_ROW = "CURRENT ROW"
+    GROUP = "GROUP"
+    TIES = "TIES"
+    NO_OTHERS = "NO OTHERS"
+
+
 class JSONOperators(Enum):
     HAS_KEY = "?"
     CONTAINS = "@>"
