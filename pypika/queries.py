@@ -84,11 +84,140 @@ class AliasedQuery(Selectable):
             return self.name
         return self.query.get_sql(**kwargs)
 
+    def get_definition_sql(self, **kwargs: Any) -> str:
+        return self.name + " AS (" + self.query.get_sql(subquery=False, with_alias=False, **kwargs) + ") "
+
     def __eq__(self, other: AliasedQuery) -> bool:
         return isinstance(other, AliasedQuery) and self.name == other.name
 
     def __hash__(self) -> int:
         return hash(str(self.name))
+
+
+def _static_select_count(selectable: Selectable) -> int | None:
+    """
+    Determines how many columns a selectable outputs when the count can be known statically.
+
+    :return:
+        The number of output columns, or ``None`` when the count cannot be determined statically, for example when
+        ``*`` is selected.
+    """
+    if isinstance(selectable, QueryBuilder):
+        if selectable._select_star or any(isinstance(select, Star) for select in selectable._selects):
+            return None
+        return len(selectable._selects)
+
+    if isinstance(selectable, _SetOperation):
+        counts = [_static_select_count(selectable.base_query)] + [
+            _static_select_count(query) for _, query in selectable._set_operation
+        ]
+        if any(count is None for count in counts):
+            return None
+        if len(set(counts)) > 1:
+            raise SetOperationException("Queries must have an equal number of select statements in a set operation.")
+        return counts[0]
+
+    return None
+
+
+class CTE(AliasedQuery):
+    """
+    A Common Table Expression with optional explicit output columns and support for recursive queries.
+
+    A ``CTE`` instance doubles as the reference to the CTE: use it in ``FROM`` and ``JOIN`` clauses -- including
+    inside its own body when building a recursive CTE -- and access its output columns as attributes or items, e.g.
+    ``cte.some_column``.  The reference lives in its own scope: a CTE defined on a subquery shadows an outer CTE
+    with the same name, and a CTE may reference any CTE added to the same query before it.
+
+    For recursive CTEs, create the instance without a query, reference it in the recursive member, connect the
+    anchor and recursive members with ``union_all`` and bind the result with :meth:`define`::
+
+        tree = CTE(name="tree", columns=["id", "depth"], recursive=True)
+        anchor = Query.from_(directories).select(directories.id, 0).where(directories.parent_id.isnull())
+        recursive = Query.from_(tree).select(directories.id, tree.depth + 1)
+        tree = tree.define(anchor.union_all(recursive))
+        query = Query.with_(tree).from_(tree).select("*")
+
+    When ``columns`` are declared, the column count of the query is validated eagerly whenever it can be
+    determined statically.  The count cannot be determined for queries selecting ``*`` (or table stars); in that
+    case the validation is skipped and a mismatch will only surface when the database executes the query.
+    """
+
+    def __init__(
+        self,
+        selectable: Selectable | None = None,
+        name: str | None = None,
+        recursive: bool = False,
+        columns: str | Field | Sequence[str | Field] | None = None,
+    ) -> None:
+        if name is None:
+            name = getattr(selectable, "alias", None)
+        if name is None:
+            raise QueryException("A CTE requires a name.")
+        super().__init__(name, selectable)
+        self._recursive = recursive
+        if columns is None:
+            self._columns = None
+        else:
+            if isinstance(columns, (str, Field)):
+                columns = [columns]
+            self._columns = [column.name if isinstance(column, Field) else str(column) for column in columns]
+        if selectable is not None:
+            self._validate_column_count(selectable)
+
+    @property
+    def recursive(self) -> bool:
+        return self._recursive
+
+    @property
+    def columns(self) -> list[str] | None:
+        return self._columns
+
+    @builder
+    def define(self, selectable: Selectable) -> None:
+        """
+        Binds the query body to this CTE and returns a new ``CTE`` instance, leaving this instance unbound.  For a
+        recursive CTE, pass the anchor and recursive members connected with ``union_all``.
+
+        :param selectable:
+            The query the CTE refers to.
+        :return:
+            A new ``CTE`` instance with the query bound.
+        """
+        if self.query is not None:
+            raise AttributeError("'CTE' object already has attribute 'query'")
+        self._validate_column_count(selectable)
+        self.query = selectable
+
+    def _validate_column_count(self, selectable: Selectable) -> None:
+        if self._columns is None:
+            return
+        select_count = _static_select_count(selectable)
+        if select_count is not None and select_count != len(self._columns):
+            raise QueryException(
+                "CTE '{name}' declares {column_count} column(s) but its query outputs {select_count} column(s).".format(
+                    name=self.name, column_count=len(self._columns), select_count=select_count
+                )
+            )
+
+    def get_sql(self, **kwargs: Any) -> str:
+        if self.alias and self.alias != self.name:
+            return format_alias_sql(self.name, self.alias, **kwargs)
+        return self.name
+
+    def get_definition_sql(self, **kwargs: Any) -> str:
+        if self.query is None:
+            raise QueryException(
+                "CTE '{name}' has no query. Use CTE.define(...) to bind a query to it.".format(name=self.name)
+            )
+        columns = ""
+        if self._columns:
+            columns = "({})".format(",".join(self._columns))
+        return "{name}{columns} AS ({query}) ".format(
+            name=self.name,
+            columns=columns,
+            query=self.query.get_sql(subquery=False, with_alias=False, **kwargs),
+        )
 
 
 class Schema:
@@ -483,7 +612,7 @@ class Query:
         return cls._builder(**kwargs).into(table)
 
     @classmethod
-    def with_(cls, table: str | Selectable, name: str, **kwargs: Any) -> QueryBuilder:
+    def with_(cls, table: str | Selectable, name: str | None = None, **kwargs: Any) -> QueryBuilder:
         return cls._builder(**kwargs).with_(table, name)
 
     @classmethod
@@ -858,9 +987,36 @@ class QueryBuilder(Selectable, Term):
             self._select_star_tables.add(new_table)
 
     @builder
-    def with_(self, selectable: Selectable, name: str) -> None:
-        t = AliasedQuery(name, selectable)
-        self._with.append(t)
+    def with_(self, selectable: Selectable, name: str | None = None) -> None:
+        """
+        Adds a common table expression to the query.
+
+        :param selectable:
+            Either the query the CTE refers to (together with ``name``), or a ``CTE`` instance, which supports
+            explicit output columns and recursive queries.  A ``CTE`` instance must have its query bound, either
+            via its constructor or via ``CTE.define``.
+        :param name:
+            The name of the CTE.  Not required (and ignored) when ``selectable`` is a ``CTE`` instance.
+        """
+        if isinstance(selectable, CTE):
+            cte = selectable
+            if cte.query is None:
+                raise QueryException(
+                    "Cannot add CTE '{name}' to a query before its query is defined. "
+                    "Use CTE.define(...) to bind a query first.".format(name=cte.name)
+                )
+        else:
+            if name is None:
+                raise QueryException("A name is required when adding a CTE query.")
+            cte = AliasedQuery(name, selectable)
+
+        if any(clause.name == cte.name for clause in self._with):
+            raise QueryException(
+                "A CTE named '{name}' is already defined for this query. "
+                "CTE names must be unique within the same WITH clause.".format(name=cte.name)
+            )
+
+        self._with.append(cte)
 
     @builder
     def into(self, table: str | Table) -> None:
@@ -1399,9 +1555,9 @@ class QueryBuilder(Selectable, Term):
         return querystring
 
     def _with_sql(self, **kwargs: Any) -> str:
-        return "WITH " + ",".join(
-            clause.name + " AS (" + clause.get_sql(subquery=False, with_alias=False, **kwargs) + ") "
-            for clause in self._with
+        recursive = any(isinstance(clause, CTE) and clause.recursive for clause in self._with)
+        return ("WITH RECURSIVE " if recursive else "WITH ") + ",".join(
+            clause.get_definition_sql(**kwargs) for clause in self._with
         )
 
     def _distinct_sql(self, **kwargs: Any) -> str:

@@ -879,6 +879,61 @@ You can use as much as `.with_()` as you want.
 
     WITH an_alias AS (SELECT * FROM "customers") SELECT * FROM an_alias
 
+Common Table Expressions
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``CTE`` class provides explicit output columns and recursive queries.  A ``CTE`` instance doubles as the
+reference to the CTE: use it in ``FROM`` and ``JOIN`` clauses and access its output columns as attributes.  For a
+recursive CTE, create the instance without a query, reference it in the recursive member, connect the anchor and
+recursive members with ``union_all`` and bind the result with ``define``.  If any CTE in the query is recursive,
+the ``WITH RECURSIVE`` keyword is used.
+
+.. code-block:: python
+
+    from pypika import CTE, Query, Table
+    from pypika.terms import Function
+
+    directories = Table('directories')
+
+    tree = CTE(name="tree", columns=["id", "depth", "path"], recursive=True)
+
+    anchor = (Query
+              .from_(directories, wrap_set_operation_queries=False)
+              .select(directories.id, 0, directories.name)
+              .where(directories.parent_id.isnull()))
+    recursive = (Query
+                 .from_(tree)
+                 .join(directories)
+                 .on(directories.parent_id == tree.id)
+                 .select(directories.id, tree.depth + 1, Function("printf", "%s/%s", tree.path, directories.name)))
+
+    tree = tree.define(anchor.union_all(recursive))
+
+    query = (Query
+             .with_(tree)
+             .from_(tree)
+             .select('id', 'depth', 'path'))
+
+.. code-block:: sql
+
+    WITH RECURSIVE tree(id,depth,path) AS (SELECT "id",0,"name" FROM "directories" WHERE "parent_id" IS NULL
+    UNION ALL SELECT "directories"."id","tree"."depth"+1,printf('%s/%s',"tree"."path","directories"."name") FROM tree
+    JOIN "directories" ON "directories"."parent_id"="tree"."id") SELECT "tree"."id","tree"."depth","tree"."path" FROM tree
+
+.. note::
+
+    This example targets SQLite: ``printf`` builds the path column, and ``wrap_set_operation_queries=False``
+    renders the UNION ALL members without wrapping parentheses, which SQLite does not accept inside a CTE body.
+
+A CTE defined on a subquery has its own scope and shadows an outer CTE with the same name, and a CTE may reference
+any CTE added to the same query before it.  CTE names must be unique within one query: adding a second CTE with an
+existing name raises a ``QueryException`` instead of silently overwriting it.
+
+When ``columns`` are declared, the column count of the CTE query is validated eagerly whenever it can be
+determined statically, and a mismatch raises a ``QueryException``.  The count cannot be determined for queries
+selecting ``*`` (or table stars); in that case the validation is skipped and a mismatch will only surface when the
+database executes the query.
+
 
 Inserting Data
 ^^^^^^^^^^^^^^

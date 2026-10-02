@@ -68,6 +68,7 @@ from pypika.enums import (
 # noinspection PyUnresolvedReferences
 from pypika.queries import (
     AliasedQuery,
+    CTE,
     Column,
     Database,
     Query,
@@ -139,6 +140,7 @@ __all__ = (
     'JoinType',
     'Order',
     'AliasedQuery',
+    'CTE',
     'Query',
     'Schema',
     'Table',
