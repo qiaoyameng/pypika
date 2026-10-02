@@ -1110,7 +1110,37 @@ Using ``limit`` for performing update
 
 .. code-block:: sql
 
-    UPDATE "customers" SET "lname"='smith' LIMIT 2
+   UPDATE "customers" SET "lname"='smith' LIMIT 2
+
+Merging Data
+^^^^^^^^^^^^
+The first version of MERGE support uses PostgreSQL's syntax and is available through ``PostgreSQLQuery``.
+Conditions are evaluated in branch order within each ``WHEN MATCHED`` and ``WHEN NOT MATCHED`` scope.
+
+.. code-block:: python
+
+    from pypika import Tables
+    from pypika.dialects import PostgreSQLQuery
+
+    customers, staging = Tables("customers", "staging")
+
+    merge = (
+        PostgreSQLQuery.merge(customers, staging, customers.id == staging.id)
+        .when_matched(staging.deleted == True)
+        .then_delete()
+        .when_matched()
+        .then_update(customers.name, staging.name)
+        .when_not_matched()
+        .then_insert(customers.id, customers.name)
+        .values(staging.id, staging.name)
+    )
+
+.. code-block:: sql
+
+   MERGE INTO "customers" USING "staging" ON "customers"."id"="staging"."id"
+   WHEN MATCHED AND "staging"."deleted"=true THEN DELETE
+   WHEN MATCHED THEN UPDATE SET "name"="staging"."name"
+   WHEN NOT MATCHED THEN INSERT ("id","name") VALUES ("staging"."id","staging"."name")
 
 .. _advanced_start:
 

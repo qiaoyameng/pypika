@@ -10,6 +10,7 @@ from pypika.queries import (
     CreateQueryBuilder,
     Database,
     DropQueryBuilder,
+    MergeQueryBuilder,
     Query,
     QueryBuilder,
     Selectable,
@@ -413,6 +414,30 @@ class PostgreSQLQuery(Query):
     @classmethod
     def _builder(cls, **kwargs) -> PostgreSQLQueryBuilder:
         return PostgreSQLQueryBuilder(**kwargs)
+
+    @classmethod
+    def merge(
+        cls,
+        target: str | Table,
+        source: str | Selectable | None = None,
+        on: Criterion | None = None,
+        **kwargs: Any,
+    ) -> PostgreSQLMergeQueryBuilder:
+        return PostgreSQLMergeQueryBuilder(target, source, on, **kwargs)
+
+
+class PostgreSQLMergeQueryBuilder(MergeQueryBuilder):
+    QUOTE_CHAR = '"'
+    QUERY_CLS = PostgreSQLQuery
+
+    def __init__(
+        self,
+        target: str | Table,
+        source: str | Selectable | None = None,
+        on: Criterion | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(target, source, on, dialect=Dialects.POSTGRESQL, **kwargs)
 
 
 class PostgreSQLQueryBuilder(QueryBuilder):
