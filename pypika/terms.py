@@ -4,14 +4,27 @@ import inspect
 import re
 import sys
 import uuid
+from copy import copy
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from datetime import date, datetime, time
 from enum import Enum
+from numbers import Number
 from typing import TYPE_CHECKING, Any, TypeVar, overload
 
-from pypika.enums import Arithmetic, Boolean, Comparator, Dialects, Equality, JSONOperators, Matching, Order
+from pypika.enums import (
+    Arithmetic,
+    Boolean,
+    Comparator,
+    Dialects,
+    Equality,
+    JSONOperators,
+    Matching,
+    NullsOrder,
+    Order,
+)
 from pypika.utils import (
     CaseException,
+    DialectNotSupported,
     FunctionException,
     builder,
     format_alias_sql,
@@ -1448,12 +1461,15 @@ class Function(Criterion):
 
     def get_function_sql(self, **kwargs: Any) -> str:
         special_params_sql = self.get_special_params_sql(**kwargs)
+        arg_kwargs = dict(kwargs)
+        arg_kwargs["with_alias"] = False
+        arg_kwargs["subquery"] = True
 
         return "{name}({args}{special})".format(
             name=self.name,
             args=",".join(
                 (
-                    p.get_sql(with_alias=False, subquery=True, **kwargs)
+                    p.get_sql(**arg_kwargs)
                     if hasattr(p, "get_sql")
                     else self.get_arg_sql(p, **kwargs)
                 )
@@ -1469,7 +1485,9 @@ class Function(Criterion):
         dialect = kwargs.pop("dialect", None)
 
         # FIXME escape
-        function_sql = self.get_function_sql(with_namespace=with_namespace, quote_char=quote_char, dialect=dialect)
+        function_sql = self.get_function_sql(
+            with_namespace=with_namespace, quote_char=quote_char, dialect=dialect, **kwargs
+        )
 
         if self.schema is not None:
             function_sql = "{schema}.{function}".format(
@@ -1569,6 +1587,217 @@ class AnalyticFunction(AggregateFunction):
             sql += f" OVER({partition_sql})"
 
         return sql
+
+
+class OrderedSetAggregate(AggregateFunction):
+    """
+    Base class for ordered-set aggregates, rendered as
+    ``NAME(args) WITHIN GROUP (ORDER BY ...) [FILTER(WHERE ...)]``.
+
+    Direct function arguments (``args``) are kept separate from the
+    ``WITHIN GROUP`` sort specification so neither clause can leak into the
+    other.  Ordered-set aggregates are aggregates, not window functions, so
+    ``OVER`` is never emitted.
+    """
+
+    # Number of direct arguments required, checked at construction time.
+    # ``None`` disables the static arity check for generic usage.
+    num_args: int | None = None
+    # Number of ``WITHIN GROUP`` sort items required.  ``None`` allows any
+    # number (including zero), at least one is always required.
+    num_ordered: int | None = None
+
+    # Dialects which are known to support this ordered-set aggregate.
+    supported_dialects: tuple[Dialects | None, ...] = (
+        None,
+        Dialects.POSTGRESQL,
+        Dialects.REDSHIFT,
+    )
+
+    def __init__(self, name: str, *args: Any, **kwargs: Any) -> None:
+        super().__init__(name, *args, **kwargs)
+        if self.num_args is not None and len(self.args) != self.num_args:
+            raise FunctionException(
+                "Function {name} requires {expected} argument(s), {actual} passed".format(
+                    name=name,
+                    expected=self.num_args,
+                    actual=len(self.args),
+                )
+            )
+
+        self._within_group: list[tuple[Any, Order | None, NullsOrder | None]] = []
+
+    def __copy__(self) -> "OrderedSetAggregate":
+        # ``@builder`` uses a shallow copy, so mutable builder state must be
+        # duplicated here to preserve immutability across chained calls.
+        newone = type(self).__new__(type(self))
+        newone.__dict__.update(self.__dict__)
+        newone._filters = copy(self._filters)
+        newone._within_group = copy(self._within_group)
+        return newone
+
+    @builder
+    def within_group(self, *terms: Any, order: Order | None = None, nulls: NullsOrder | None = None) -> None:
+        for term in terms:
+            if isinstance(term, tuple):
+                if len(term) not in (1, 2, 3):
+                    raise FunctionException(
+                        "WITHIN GROUP sort item must be a (term[, order[, nulls]]) tuple, "
+                        "{length} members passed".format(length=len(term))
+                    )
+                ordered_term = term[0]
+                item_order = term[1] if len(term) > 1 and term[1] is not None else order
+                item_nulls = term[2] if len(term) > 2 and term[2] is not None else nulls
+            else:
+                ordered_term = term
+                item_order = order
+                item_nulls = nulls
+            self._within_group.append(
+                (
+                    self.wrap_constant(ordered_term) if not hasattr(ordered_term, "get_sql") else ordered_term,
+                    item_order,
+                    item_nulls,
+                )
+            )
+
+        if self.num_ordered is not None and len(self._within_group) > self.num_ordered:
+            raise FunctionException(
+                "Function {name} accepts at most {expected} WITHIN GROUP sort item(s), {actual} passed".format(
+                    name=self.name,
+                    expected=self.num_ordered,
+                    actual=len(self._within_group),
+                )
+            )
+
+    def over(self, *terms: Any, **kwargs: Any) -> None:
+        raise AttributeError(
+            "Ordered-set aggregate '{name}' cannot be used as a window function with OVER".format(name=self.name)
+        )
+
+    def validate(self, dialect: Dialects | None = None) -> None:
+        if not self._within_group:
+            raise FunctionException(
+                "Function {name} requires a WITHIN GROUP sort specification".format(name=self.name)
+            )
+        if self.num_ordered is not None and len(self._within_group) != self.num_ordered:
+            raise FunctionException(
+                "Function {name} requires {expected} WITHIN GROUP sort item(s), {actual} passed".format(
+                    name=self.name,
+                    expected=self.num_ordered,
+                    actual=len(self._within_group),
+                )
+            )
+        if dialect not in self.supported_dialects:
+            raise DialectNotSupported(
+                "Ordered-set aggregate '{name}' is not supported for dialect {dialect}".format(
+                    name=self.name,
+                    dialect=dialect.value if isinstance(dialect, Dialects) else dialect,
+                )
+            )
+
+        for term, _, _ in self._within_group:
+            if hasattr(term, "validate"):
+                term.validate(dialect)
+
+    def nodes_(self) -> Iterator[NodeT]:
+        yield self
+        for arg in self.args:
+            yield from arg.nodes_()
+        for term, _, _ in self._within_group:
+            yield from term.nodes_()
+
+    @builder
+    def replace_table(self, current_table: Table | None, new_table: Table | None) -> None:
+        super().replace_table(current_table, new_table)
+        self._within_group = [
+            (
+                term.replace_table(current_table, new_table) if hasattr(term, "replace_table") else term,
+                item_order,
+                item_nulls,
+            )
+            for term, item_order, item_nulls in self._within_group
+        ]
+
+    def _within_group_order_item_sql(
+        self,
+        term: Any,
+        orient: Order | None,
+        nulls: NullsOrder | None,
+        **kwargs: Any,
+    ) -> str:
+        item_sql = term.get_sql(with_alias=False, **kwargs) if hasattr(term, "get_sql") else str(term)
+        if orient is not None:
+            item_sql = "{item} {orient}".format(item=item_sql, orient=orient.value)
+        if nulls is not None:
+            item_sql = "{item} {nulls}".format(item=item_sql, nulls=nulls.value)
+        return item_sql
+
+    def get_within_group_sql(self, **kwargs: Any) -> str:
+        return " WITHIN GROUP (ORDER BY {orderby})".format(
+            orderby=",".join(
+                self._within_group_order_item_sql(term, orient, nulls, **kwargs)
+                for term, orient, nulls in self._within_group
+            )
+        )
+
+    def get_function_sql(self, **kwargs: Any) -> str:
+        dialect = kwargs.get("dialect")
+        self.validate(dialect)
+
+        # Build the direct-argument call directly rather than via
+        # AggregateFunction.get_function_sql, because the FILTER clause must be
+        # emitted after WITHIN GROUP, not directly after the call.
+        arg_kwargs = dict(kwargs)
+        arg_kwargs["with_alias"] = False
+        arg_kwargs["subquery"] = True
+        sql = "{name}({args})".format(
+            name=self.name,
+            args=",".join(
+                p.get_sql(**arg_kwargs) if hasattr(p, "get_sql") else self.get_arg_sql(p, **kwargs)
+                for p in self.args
+            ),
+        )
+        sql += self.get_within_group_sql(**kwargs)
+
+        filter_sql = self.get_filter_sql(**kwargs)
+        if self._include_filter:
+            sql += " FILTER({filter_sql})".format(filter_sql=filter_sql)
+
+        return sql
+
+
+class PercentileBase(OrderedSetAggregate):
+    num_ordered = 1
+
+    def __init__(self, name: str, *args: Any, **kwargs: Any) -> None:
+        if len(args) != 1:
+            raise FunctionException(
+                "Function {name} requires 1 argument, {actual} passed".format(name=name, actual=len(args))
+            )
+        super().__init__(name, *args, **kwargs)
+        self._validate_fraction(self.args[0])
+
+    @staticmethod
+    def _validate_fraction(fraction: Any) -> None:
+        # Direct arguments are wrapped as ValueWrapper instances; plain
+        # Parameters and other terms pass through untouched.
+        if isinstance(fraction, ValueWrapper):
+            fraction = fraction.value
+
+        if isinstance(fraction, Term):
+            # Parameters (e.g. placeholders) are bound later and therefore not
+            # range-checked here.
+            return
+
+        if isinstance(fraction, bool) or not isinstance(fraction, Number):
+            raise FunctionException(
+                "Percentile fraction must be a number between 0 and 1, {value} passed".format(value=fraction)
+            )
+
+        if not 0 <= float(fraction) <= 1:
+            raise FunctionException(
+                "Percentile fraction must be between 0 and 1, {value} passed".format(value=fraction)
+            )
 
 
 EdgeT = TypeVar("EdgeT", bound="WindowFrameAnalyticFunction.Edge")

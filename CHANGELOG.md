@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### New Features
+
+- **Ordered-set aggregates** - Added `fn.PercentileCont` and `fn.PercentileDisc` plus the generic
+  `fn.WithinGroupFunction` for `NAME(args) WITHIN GROUP (ORDER BY ...)` syntax. Sort items support direction and
+  `NULLS FIRST`/`NULLS LAST` via the new `NullsOrder` enum. Direct function arguments, the aggregate's internal sort
+  specification and the outer query `ORDER BY` are kept separate. Percentile fractions (0-1) and argument/sort-item
+  counts are validated, fraction parameters use the existing parameter binding mechanism, `FILTER` and aliases are
+  supported while `OVER` is rejected, and unsupported dialects raise an error (PostgreSQL and Redshift supported).
+  Includes a small in-memory reference evaluator in `pypika.percentiles`.
+
 ## v0.50.0 (2025-01-14)
 
 ### New Features

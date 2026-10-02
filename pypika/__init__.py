@@ -62,6 +62,7 @@ from pypika.dialects import (
 from pypika.enums import (
     DatePart,
     JoinType,
+    NullsOrder,
     Order,
 )
 

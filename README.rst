@@ -398,6 +398,51 @@ After adding a ``GROUP BY`` clause to a query, the ``HAVING`` clause becomes ava
     WHERE transacted BETWEEN '2015-01-01' AND '2016-01-01'
     GROUP BY customer_id HAVING SUM(total)>=1000
 
+Ordered-Set Aggregates (Percentiles)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Ordered-set aggregates combine direct function arguments with an internal
+``ORDER BY`` clause via ``WITHIN GROUP``.  PyPika provides ``PercentileCont``
+(continuous, interpolated) and ``PercentileDisc`` (discrete, nearest stored
+value) plus the generic ``WithinGroupFunction`` wrapper.  The fraction must be
+between ``0`` and ``1`` and the sort specification is given by
+``.within_group(...)``, which accepts an ``order`` and ``nulls`` argument or a
+``(term, order, nulls)`` tuple for each sort item.
+
+.. code-block:: python
+
+    from pypika import Order
+    from pypika.enums import NullsOrder
+    from pypika import functions as fn
+
+    requests = Table('requests')
+    q = Query.from_(requests) \
+        .groupby(requests.region) \
+        .select(
+            requests.region,
+            fn.PercentileCont(0.5).within_group(requests.latency).as_('p50'),
+            fn.PercentileDisc(0.95)
+              .within_group((requests.latency, Order.desc, NullsOrder.nulls_last))
+              .filter(requests.status == 'ok')
+              .as_('p95'),
+        )
+
+.. code-block:: sql
+
+    SELECT "region",
+           PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY "latency") "p50",
+           PERCENTILE_DISC(0.95) WITHIN GROUP (ORDER BY "latency" DESC NULLS LAST)
+             FILTER(WHERE "status"='ok') "p95"
+    FROM "requests" GROUP BY "region"
+
+The function argument (the percentile fraction) stays outside of
+``WITHIN GROUP`` and a query-level ``orderby(...)`` remains the outer
+``ORDER BY``.  These aggregates support ``FILTER`` and aliases but cannot be
+used as window functions (``OVER`` is rejected).  Generic functions such as
+``RANK(...) WITHIN GROUP (...)`` or ``MODE() WITHIN GROUP (...)`` are built
+with ``fn.WithinGroupFunction``.  Ordered-set aggregates are only rendered for
+PostgreSQL and Redshift; other dialects raise an error.
+
 The ``QUALIFY`` clause can be used to filter rows based on window function results. This is particularly useful
 when you want to filter after window functions have been evaluated.
 

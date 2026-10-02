@@ -6,7 +6,15 @@ from __future__ import annotations
 
 from pypika import Field
 from pypika.enums import SqlTypes
-from pypika.terms import AggregateFunction, Function, LiteralValue, Star, Term
+from pypika.terms import (
+    AggregateFunction,
+    Function,
+    LiteralValue,
+    OrderedSetAggregate,
+    PercentileBase,
+    Star,
+    Term,
+)
 from pypika.utils import builder
 
 __author__ = "Timothy Heys"
@@ -101,6 +109,49 @@ class ApproximatePercentile(AggregateFunction):
 
     def get_special_params_sql(self, **kwargs):
         return "USING PARAMETERS percentile={percentile}".format(percentile=self.percentile)
+
+
+# Ordered-Set Aggregates
+#
+# These are rendered as ``NAME(args) WITHIN GROUP (ORDER BY ...)``.  They are
+# aggregates (and may carry a FILTER clause) but cannot be window functions, so
+# no OVER clause is emitted.
+class PercentileCont(PercentileBase):
+    """
+    Continuous percentile, interpolated between the two surrounding values.
+
+    ``PercentileCont(0.5).within_group(latency)`` renders
+    ``PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY latency)``.
+    """
+
+    def __init__(self, *args, alias=None):
+        super().__init__("PERCENTILE_CONT", *args, alias=alias)
+
+
+class PercentileDisc(PercentileBase):
+    """
+    Discrete percentile, returns the first value whose cumulative distribution
+    is greater than or equal to the given fraction.
+
+    ``PercentileDisc(0.5).within_group(latency)`` renders
+    ``PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY latency)``.
+    """
+
+    def __init__(self, *args, alias=None):
+        super().__init__("PERCENTILE_DISC", *args, alias=alias)
+
+
+class WithinGroupFunction(OrderedSetAggregate):
+    """
+    Generic ordered-set aggregate for functions without a dedicated wrapper,
+    e.g. ``WithinGroupFunction("MODE", ()).within_group(...)`` or
+    ``WithinGroupFunction("RANK", score).within_group(target)``.
+
+    Subclasses may set ``num_args``/``num_ordered`` for a static arity check.
+    """
+
+    def __init__(self, name, *args, alias=None, **kwargs):
+        super().__init__(name, *args, alias=alias, **kwargs)
 
 
 # Type Functions
