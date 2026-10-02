@@ -71,6 +71,7 @@ from pypika.queries import (
     Column,
     Database,
     Query,
+    RecursiveCTE,
     Schema,
     Table,
 )
@@ -139,6 +140,7 @@ __all__ = (
     'JoinType',
     'Order',
     'AliasedQuery',
+    'RecursiveCTE',
     'Query',
     'Schema',
     'Table',

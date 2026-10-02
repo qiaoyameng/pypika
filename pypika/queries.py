@@ -90,6 +90,288 @@ class AliasedQuery(Selectable):
     def __hash__(self) -> int:
         return hash(str(self.name))
 
+    def get_with_sql(self, **kwargs: Any) -> str:
+        return "{name} AS ({query}) ".format(
+            name=self.name,
+            query=self.get_sql(subquery=False, with_alias=False, **kwargs),
+        )
+
+
+class RecursiveCTE(AliasedQuery):
+    def __init__(
+        self,
+        name: str,
+        columns: Sequence[str | Term | Column] | None = None,
+        anchor: Selectable | None = None,
+        recursive: Selectable | None = None,
+    ) -> None:
+        anchor, recursive = self._split_queries(anchor, recursive)
+        super().__init__(name, anchor)
+        self.columns = self._normalize_columns(columns)
+        self.anchor_query = anchor
+        self.recursive_query = recursive
+
+        if anchor is not None and recursive is not None:
+            self._validate_queries()
+
+    def __copy__(self) -> RecursiveCTE:
+        newone = copy(super())
+        newone.columns = copy(self.columns)
+        return newone
+
+    @staticmethod
+    def _split_queries(
+        anchor: Selectable | None, recursive: Selectable | None
+    ) -> tuple[Selectable | None, Selectable | None]:
+        if anchor is None:
+            return None, recursive
+
+        while isinstance(anchor, AliasedQuery) and not isinstance(anchor, RecursiveCTE):
+            if anchor.query is None:
+                break
+            anchor = anchor.query
+
+        if isinstance(anchor, _SetOperation):
+            if recursive is not None:
+                raise QueryException(
+                    "A recursive CTE accepts either a UNION ALL query or separate anchor and recursive queries."
+                )
+
+            if anchor._orderbys or anchor._limit is not None or anchor._offset:
+                raise QueryException(
+                    "Recursive CTE anchor and recursive queries cannot use the set operation's ORDER BY, LIMIT, or "
+                    "OFFSET clause."
+                )
+
+            if len(anchor._set_operation) != 1 or anchor._set_operation[0][0] != SetOperation.union_all:
+                raise QueryException(
+                    "A recursive CTE requires its anchor and recursive queries to be joined with UNION ALL."
+                )
+
+            return anchor.base_query, anchor._set_operation[0][1]
+
+        return anchor, recursive
+
+    @staticmethod
+    def _normalize_columns(columns: Sequence[str | Term | Column] | None) -> list[str]:
+        if columns is None:
+            return []
+
+        if isinstance(columns, (str, Term, Column)):
+            columns = [columns]
+
+        normalized = []
+        for column in columns:
+            if isinstance(column, str):
+                normalized.append(column)
+            elif isinstance(column, Column):
+                normalized.append(column.name)
+            elif hasattr(column, "name"):
+                normalized.append(column.name)
+            else:
+                raise QueryException("Recursive CTE columns must be column names, Fields, or Column instances.")
+
+        return normalized
+
+    @staticmethod
+    def _unwrap_query(query: Selectable) -> Selectable:
+        while isinstance(query, AliasedQuery) and not isinstance(query, RecursiveCTE) and query.query is not None:
+            query = query.query
+        return query
+
+    def _query_column_counts(self, query: Selectable) -> list[int]:
+        query = self._unwrap_query(query)
+
+        if isinstance(query, RecursiveCTE):
+            if not query.columns:
+                raise QueryException(
+                    "Cannot statically determine the number of output columns for recursive CTE '{name}'.".format(
+                        name=query.name
+                    )
+                )
+            return [len(query.columns)]
+
+        if isinstance(query, _SetOperation):
+            counts = self._query_column_counts(query.base_query)
+            for _, set_query in query._set_operation:
+                counts.extend(self._query_column_counts(set_query))
+            return counts
+
+        if not isinstance(query, QueryBuilder):
+            raise QueryException(
+                "Cannot statically determine the number of output columns for recursive CTE '{name}'. Use an explicit "
+                "QueryBuilder select list.".format(name=self.name)
+            )
+
+        if any(isinstance(select, Star) for select in query._selects):
+            raise QueryException(
+                "Cannot statically determine the number of output columns for recursive CTE '{name}' because a query "
+                "contains SELECT *. Replace it with an explicit select list.".format(name=self.name)
+            )
+
+        return [len(query._selects)]
+
+    def _validate_queries(self) -> None:
+        if self.anchor_query is None or self.recursive_query is None:
+            raise QueryException(
+                "Recursive CTE '{name}' requires both anchor and recursive queries.".format(name=self.name)
+            )
+
+        if not self.columns:
+            raise QueryException("Recursive CTE '{name}' requires explicit output columns.".format(name=self.name))
+
+        anchor_counts = self._query_column_counts(self.anchor_query)
+        recursive_counts = self._query_column_counts(self.recursive_query)
+        expected_count = anchor_counts[0]
+
+        if any(count != expected_count for count in anchor_counts + recursive_counts):
+            raise QueryException(
+                "The anchor, recursive, and CTE column lists must contain the same number of columns."
+            )
+
+        if len(self.columns) != expected_count:
+            raise QueryException(
+                "Recursive CTE '{name}' declares {declared} output columns but its queries select {selected}.".format(
+                    name=self.name, declared=len(self.columns), selected=expected_count
+                )
+            )
+
+        if not self._references_cte(self._unwrap_query(self.recursive_query), self.name):
+            raise QueryException(
+                "The recursive query for CTE '{name}' must reference the CTE itself.".format(name=self.name)
+            )
+
+        invalid_columns = self._invalid_recursive_columns(self.recursive_query)
+        if invalid_columns:
+            field_names = ", ".join(field.name for field in invalid_columns)
+            raise QueryException(
+                "Recursive CTE '{name}' does not declare column(s): {columns}.".format(
+                    name=self.name, columns=field_names
+                )
+            )
+
+        self._validate_anchor_scope()
+
+    def _validate_anchor_scope(self) -> None:
+        anchor = self._unwrap_query(self.anchor_query)
+        if isinstance(anchor, QueryBuilder) and self._references_cte(anchor, self.name):
+            raise QueryException(
+                "The anchor query for recursive CTE '{name}' cannot reference the CTE itself.".format(name=self.name)
+            )
+
+    def _references_cte(self, query: Selectable, name: str) -> bool:
+        query = self._unwrap_query(query)
+        if not isinstance(query, QueryBuilder):
+            return False
+
+        local_cte_names = {clause.name for clause in query._with}
+        if name in local_cte_names:
+            return False
+
+        for selectable in list(query._from) + [join.item for join in query._joins]:
+            if isinstance(selectable, AliasedQuery) and selectable.name == name:
+                return True
+            if self._references_cte(selectable, name):
+                return True
+
+        for term in self._query_terms(query):
+            for field in term.fields_():
+                if isinstance(field.table, AliasedQuery) and field.table.name == name:
+                    return True
+
+        for clause in query._with:
+            if self._references_cte(clause, name):
+                return True
+
+        return False
+
+    @staticmethod
+    def _query_terms(query: QueryBuilder) -> list[Term]:
+        terms = list(query._selects)
+        terms.extend(query._groupbys)
+        terms.extend(field for field, _ in query._orderbys)
+        if query._wheres is not None:
+            terms.append(query._wheres)
+        if query._havings is not None:
+            terms.append(query._havings)
+        if query._qualifys is not None:
+            terms.append(query._qualifys)
+        if query._prewheres is not None:
+            terms.append(query._prewheres)
+        terms.extend(join.criterion for join in query._joins if isinstance(join, JoinOn))
+        return terms
+
+    def _invalid_recursive_columns(self, query: Selectable, seen: set[int] | None = None) -> list[Field]:
+        query = self._unwrap_query(query)
+        seen = set() if seen is None else seen
+        if id(query) in seen or not isinstance(query, QueryBuilder):
+            return []
+
+        seen.add(id(query))
+        if self.name in {clause.name for clause in query._with}:
+            return []
+
+        invalid = []
+        for term in self._query_terms(query):
+            for field in term.fields_():
+                if isinstance(field.table, AliasedQuery) and field.table.name == self.name and field.name != "*":
+                    if field.name not in self.columns:
+                        invalid.append(field)
+
+        for selectable in list(query._from) + [join.item for join in query._joins] + query._with:
+            invalid.extend(self._invalid_recursive_columns(selectable, seen))
+
+        return invalid
+
+    @builder
+    def anchor(self, anchor: Selectable) -> RecursiveCTE:
+        self.anchor_query = self._split_queries(anchor, None)[0]
+        self.query = self.anchor_query
+        if self.anchor_query is not None and self.recursive_query is not None:
+            self._validate_queries()
+
+    @builder
+    def recursive(self, recursive: Selectable) -> RecursiveCTE:
+        self.recursive_query = recursive
+        if self.anchor_query is not None and self.recursive_query is not None:
+            self._validate_queries()
+
+    @builder
+    def union_all(self, recursive: Selectable) -> RecursiveCTE:
+        self.recursive_query = recursive
+        if self.anchor_query is not None and self.recursive_query is not None:
+            self._validate_queries()
+
+    def reference(self) -> AliasedQuery:
+        return AliasedQuery(self.name)
+
+    @builder
+    def replace_table(self, current_table: Table | None, new_table: Table | None) -> RecursiveCTE:
+        if self.anchor_query is not None and hasattr(self.anchor_query, "replace_table"):
+            self.anchor_query = self.anchor_query.replace_table(current_table, new_table)
+        if self.recursive_query is not None and hasattr(self.recursive_query, "replace_table"):
+            self.recursive_query = self.recursive_query.replace_table(current_table, new_table)
+
+    def get_with_sql(self, **kwargs: Any) -> str:
+        self._validate_queries()
+        quote_char = kwargs.get("quote_char")
+        columns = " ({columns})".format(
+            columns=",".join(format_quotes(column, quote_char) for column in self.columns)
+        )
+        return "{name}{columns} AS ({query}) ".format(
+            name=self.name,
+            columns=columns,
+            query=self._definition_sql(**kwargs),
+        )
+
+    def _definition_sql(self, **kwargs: Any) -> str:
+        anchor_sql = self.anchor_query.get_sql(subquery=False, with_alias=False, **kwargs)
+        recursive_sql = self.recursive_query.get_sql(subquery=False, with_alias=False, **kwargs)
+        return "{anchor} UNION ALL {recursive}".format(anchor=anchor_sql, recursive=recursive_sql)
+
+    def get_sql(self, with_alias: bool = False, subquery: bool = False, **kwargs: Any) -> str:
+        return self.name
+
 
 class Schema:
     def __init__(self, name: str, parent: Schema | None = None) -> None:
@@ -483,8 +765,20 @@ class Query:
         return cls._builder(**kwargs).into(table)
 
     @classmethod
-    def with_(cls, table: str | Selectable, name: str, **kwargs: Any) -> QueryBuilder:
+    def with_(cls, table: str | Selectable | RecursiveCTE, name: str | None = None, **kwargs: Any) -> QueryBuilder:
         return cls._builder(**kwargs).with_(table, name)
+
+    @classmethod
+    def with_recursive(
+        cls,
+        name: str | RecursiveCTE,
+        columns: Sequence[str | Term | Column] | None = None,
+        anchor: Selectable | None = None,
+        recursive: Selectable | None = None,
+        **kwargs: Any,
+    ) -> QueryBuilder:
+        cte = name if isinstance(name, RecursiveCTE) else RecursiveCTE(name, columns, anchor, recursive)
+        return cls._builder(**kwargs).with_(cte)
 
     @classmethod
     def select(cls, *terms: int | float | str | bool | Term, **kwargs: Any) -> QueryBuilder:
@@ -858,9 +1152,36 @@ class QueryBuilder(Selectable, Term):
             self._select_star_tables.add(new_table)
 
     @builder
-    def with_(self, selectable: Selectable, name: str) -> None:
-        t = AliasedQuery(name, selectable)
+    def with_(self, selectable: Selectable | RecursiveCTE, name: str | None = None) -> None:
+        if isinstance(selectable, RecursiveCTE):
+            if name is not None and name != selectable.name:
+                raise QueryException(
+                    "Cannot register recursive CTE '{expected}' under name '{name}'.".format(
+                        expected=selectable.name, name=name
+                    )
+                )
+            t = selectable
+        else:
+            if name is None:
+                raise QueryException("A CTE name is required.")
+            t = AliasedQuery(name, selectable)
+
+        if any(clause.name == t.name for clause in self._with):
+            raise QueryException("CTE name '{name}' is already defined.".format(name=t.name))
         self._with.append(t)
+
+    @builder
+    def with_recursive(
+        self,
+        name: str | RecursiveCTE,
+        columns: Sequence[str | Term | Column] | None = None,
+        anchor: Selectable | None = None,
+        recursive: Selectable | None = None,
+    ) -> QueryBuilder:
+        cte = name if isinstance(name, RecursiveCTE) else RecursiveCTE(name, columns, anchor, recursive)
+        if any(clause.name == cte.name for clause in self._with):
+            raise QueryException("CTE name '{name}' is already defined.".format(name=cte.name))
+        self._with.append(cte)
 
     @builder
     def into(self, table: str | Table) -> None:
@@ -1399,8 +1720,9 @@ class QueryBuilder(Selectable, Term):
         return querystring
 
     def _with_sql(self, **kwargs: Any) -> str:
-        return "WITH " + ",".join(
-            clause.name + " AS (" + clause.get_sql(subquery=False, with_alias=False, **kwargs) + ") "
+        recursive = any(isinstance(clause, RecursiveCTE) for clause in self._with)
+        return "WITH{recursive} ".format(recursive=" RECURSIVE" if recursive else "") + ",".join(
+            clause.get_with_sql(**kwargs)
             for clause in self._with
         )
 
