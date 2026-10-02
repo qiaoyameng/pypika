@@ -62,6 +62,7 @@ from pypika.dialects import (
 from pypika.enums import (
     DatePart,
     JoinType,
+    NullsOrdering,
     Order,
 )
 
@@ -137,6 +138,7 @@ __all__ = (
     'VerticaQuery',
     'DatePart',
     'JoinType',
+    'NullsOrdering',
     'Order',
     'AliasedQuery',
     'Query',

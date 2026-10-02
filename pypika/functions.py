@@ -6,8 +6,16 @@ from __future__ import annotations
 
 from pypika import Field
 from pypika.enums import SqlTypes
-from pypika.terms import AggregateFunction, Function, LiteralValue, Star, Term
-from pypika.utils import builder
+from pypika.terms import (
+    AggregateFunction,
+    Function,
+    LiteralValue,
+    OrderedSetAggregateFunction,
+    Star,
+    Term,
+    ValueWrapper,
+)
+from pypika.utils import FunctionException, builder
 
 __author__ = "Timothy Heys"
 __email__ = "theys@kayak.com"
@@ -101,6 +109,49 @@ class ApproximatePercentile(AggregateFunction):
 
     def get_special_params_sql(self, **kwargs):
         return "USING PARAMETERS percentile={percentile}".format(percentile=self.percentile)
+
+
+class _Percentile(OrderedSetAggregateFunction):
+    """
+    Base class for the ordered-set percentile aggregates.
+
+    The fraction is a direct function argument while the sort expression is supplied via
+    :meth:`~pypika.terms.OrderedSetAggregateFunction.within_group`::
+
+        PercentileCont(0.5).within_group(table.latency)
+        # PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY "latency")
+
+    The fraction must lie in [0, 1] and is validated eagerly whenever it is statically known (plain numbers);
+    parameter objects (e.g. ``pypika.Parameter``) are bound through the regular parameter mechanism and are
+    validated by the database instead.
+    """
+
+    NUM_SORT_KEYS = 1
+    REQUIRES_WITHIN_GROUP = True
+
+    def __init__(self, name, fraction, alias=None):
+        super().__init__(name, fraction, alias=alias)
+        self._validate_fraction()
+
+    def _validate_fraction(self):
+        fraction = self.args[0]
+        if isinstance(fraction, ValueWrapper) and isinstance(fraction.value, (int, float)):
+            if not 0 <= fraction.value <= 1:
+                raise FunctionException(
+                    "Function {name} requires a fraction between 0 and 1, got {fraction}".format(
+                        name=self.name, fraction=fraction.value
+                    )
+                )
+
+
+class PercentileCont(_Percentile):
+    def __init__(self, fraction, alias=None):
+        super().__init__("PERCENTILE_CONT", fraction, alias=alias)
+
+
+class PercentileDisc(_Percentile):
+    def __init__(self, fraction, alias=None):
+        super().__init__("PERCENTILE_DISC", fraction, alias=alias)
 
 
 # Type Functions

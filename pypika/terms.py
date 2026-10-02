@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, overload
 from pypika.enums import Arithmetic, Boolean, Comparator, Dialects, Equality, JSONOperators, Matching, Order
 from pypika.utils import (
     CaseException,
+    DialectNotSupported,
     FunctionException,
     builder,
     format_alias_sql,
@@ -1495,7 +1496,7 @@ class AggregateFunction(Function):
     @builder
     def filter(self, *filters: Any) -> None:
         self._include_filter = True
-        self._filters += filters
+        self._filters = self._filters + list(filters)
 
     def get_filter_sql(self, **kwargs: Any) -> str:
         if self._include_filter:
@@ -1505,6 +1506,114 @@ class AggregateFunction(Function):
         sql = super().get_function_sql(**kwargs)
         filter_sql = self.get_filter_sql(**kwargs)
 
+        if self._include_filter:
+            sql += " FILTER({filter_sql})".format(filter_sql=filter_sql)
+
+        return sql
+
+
+class OrderedSetAggregateFunction(AggregateFunction):
+    """
+    Base class for ordered-set aggregates, e.g. ``percentile_cont(0.5) WITHIN GROUP (ORDER BY latency)``.
+
+    The sort keys passed to :meth:`within_group` are rendered inside the ``WITHIN GROUP`` clause.  They are kept
+    strictly separate from the function arguments (rendered inside the parentheses) and from any outer ``ORDER BY``
+    of the enclosing query.  Each sort key may carry a direction (``Order.asc``/``Order.desc``) and a NULLS ordering
+    (``NullsOrdering.first``/``NullsOrdering.last``).
+
+    Ordered-set aggregates cannot be used as window functions; calling :meth:`over` raises a ``FunctionException``
+    instead of silently turning the ``WITHIN GROUP`` clause into an ``OVER`` clause.
+    """
+
+    SUPPORTED_DIALECTS = frozenset({Dialects.POSTGRESQL})
+    NUM_SORT_KEYS: int | None = None
+    REQUIRES_WITHIN_GROUP = False
+
+    def __init__(self, name, *args, **kwargs):
+        super().__init__(name, *args, **kwargs)
+        self._within_group = []
+
+    def nodes_(self) -> Iterator[NodeT]:
+        yield from super().nodes_()
+        for term, _, _ in self._within_group:
+            if isinstance(term, Node):
+                yield from term.nodes_()
+
+    @builder
+    def within_group(self, *terms: Any, **kwargs: Any) -> None:
+        """
+        Adds the sort keys of the ``WITHIN GROUP (ORDER BY ...)`` clause.
+
+        :param terms:
+            The terms to order the aggregated rows by.
+        :param kwargs:
+            ``order`` (an ``Order`` member) and ``nulls`` (a ``NullsOrdering`` member) are applied to every term.
+        """
+        order = kwargs.get("order")
+        nulls = kwargs.get("nulls")
+        self._within_group = self._within_group + [(term, order, nulls) for term in terms]
+
+    def over(self, *args: Any, **kwargs: Any) -> None:
+        raise FunctionException(
+            "Ordered-set aggregates use WITHIN GROUP and cannot be used as window functions (OVER)."
+        )
+
+    @builder
+    def replace_table(self, current_table: Table | None, new_table: Table | None) -> None:
+        self.args = [param.replace_table(current_table, new_table) for param in self.args]
+        self._within_group = [
+            (term.replace_table(current_table, new_table) if isinstance(term, Node) else term, order, nulls)
+            for term, order, nulls in self._within_group
+        ]
+
+    def _validate_dialect(self, dialect: Dialects | None) -> None:
+        if dialect is not None and dialect not in self.SUPPORTED_DIALECTS:
+            raise DialectNotSupported(
+                "Ordered-set aggregates (WITHIN GROUP) are not supported for dialect '{dialect}'".format(
+                    dialect=dialect.value
+                )
+            )
+
+    def _validate_within_group(self) -> None:
+        if self.REQUIRES_WITHIN_GROUP and not self._within_group:
+            raise FunctionException(
+                "Function {name} requires a WITHIN GROUP (ORDER BY ...) clause".format(name=self.name)
+            )
+        if self.NUM_SORT_KEYS is not None and len(self._within_group) != self.NUM_SORT_KEYS:
+            raise FunctionException(
+                "Function {name} requires exactly {expected} sort key(s) in its WITHIN GROUP clause, "
+                "{actual} given".format(name=self.name, expected=self.NUM_SORT_KEYS, actual=len(self._within_group))
+            )
+
+    @staticmethod
+    def _within_group_item_sql(term: Any, order: Order | None, nulls: Any, **kwargs: Any) -> str:
+        item_sql = (
+            term.get_sql(with_alias=False, subquery=True, **kwargs) if hasattr(term, "get_sql") else str(term)
+        )
+        if order is not None:
+            item_sql += " {order}".format(order=order.value)
+        if nulls is not None:
+            item_sql += " {nulls}".format(nulls=nulls.value)
+        return item_sql
+
+    def get_within_group_sql(self, **kwargs: Any) -> str:
+        return "WITHIN GROUP (ORDER BY {orderby})".format(
+            orderby=",".join(
+                self._within_group_item_sql(term, order, nulls, **kwargs)
+                for term, order, nulls in self._within_group
+            )
+        )
+
+    def get_function_sql(self, **kwargs: Any) -> str:
+        self._validate_dialect(kwargs.get("dialect"))
+        self._validate_within_group()
+
+        sql = Function.get_function_sql(self, **kwargs)
+
+        if self._within_group:
+            sql += " {within_group}".format(within_group=self.get_within_group_sql(**kwargs))
+
+        filter_sql = self.get_filter_sql(**kwargs)
         if self._include_filter:
             sql += " FILTER({filter_sql})".format(filter_sql=filter_sql)
 
