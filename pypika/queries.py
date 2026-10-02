@@ -23,6 +23,7 @@ from pypika.terms import (
     ValueWrapper,
 )
 from pypika.utils import (
+    DialectNotSupported,
     JoinException,
     QueryException,
     RollupException,
@@ -350,6 +351,260 @@ class PeriodFor:
         return period_for_sql
 
 
+class MergeBranch:
+    MATCHED = "matched"
+    NOT_MATCHED = "not_matched"
+
+    UPDATE = "update"
+    DELETE = "delete"
+    INSERT = "insert"
+
+    def __init__(
+        self,
+        matched: bool,
+        condition: Criterion | None = None,
+        action: str | None = None,
+    ) -> None:
+        self.matched = matched
+        self.scope = self.MATCHED if matched else self.NOT_MATCHED
+        self.condition = condition
+        self.action = action
+        self.updates = []
+        self.insert_columns = []
+        self.insert_values = None
+
+    def __copy__(self) -> MergeBranch:
+        branch = MergeBranch(self.matched, self.condition, self.action)
+        branch.updates = copy(self.updates)
+        branch.insert_columns = copy(self.insert_columns)
+        branch.insert_values = copy(self.insert_values)
+        return branch
+
+
+class MergeQueryBuilder(Term):
+    QUOTE_CHAR = '"'
+    SECONDARY_QUOTE_CHAR = "'"
+
+    def __init__(
+        self,
+        target: Selectable | None = None,
+        source: Selectable | None = None,
+        criterion: Criterion | None = None,
+        branches: Sequence[MergeBranch] | None = None,
+        pending_branch: MergeBranch | None = None,
+        wrapper_cls: type[ValueWrapper] = ValueWrapper,
+        immutable: bool = True,
+        dialect: Dialects | None = None,
+    ) -> None:
+        super().__init__()
+        self._target = target
+        self._source = source
+        self._criterion = criterion
+        self._branches = list(branches or [])
+        self._pending_branch = pending_branch
+        self._wrapper_cls = wrapper_cls
+        self.immutable = immutable
+        self.dialect = dialect
+
+    def __copy__(self) -> MergeQueryBuilder:
+        return type(self)(
+            target=self._target,
+            source=self._source,
+            criterion=self._criterion,
+            branches=[copy(branch) for branch in self._branches],
+            pending_branch=copy(self._pending_branch) if self._pending_branch is not None else None,
+            wrapper_cls=self._wrapper_cls,
+            immutable=self.immutable,
+            dialect=self.dialect,
+        )
+
+    @property
+    def branches(self) -> Sequence[MergeBranch]:
+        return tuple(self._branches)
+
+    @builder
+    def using(self, source: Selectable | str) -> None:
+        if self._source is not None:
+            raise QueryException("MERGE can only have one USING source")
+        self._source = Table(source) if isinstance(source, str) else source
+
+        if isinstance(self._source, (QueryBuilder, _SetOperation)) and self._source.alias is None:
+            self._source.alias = "sq0"
+
+    @builder
+    def on(self, criterion: Criterion) -> None:
+        if self._criterion is not None:
+            raise QueryException("MERGE can only have one ON condition")
+        if not isinstance(criterion, Criterion) or isinstance(criterion, EmptyCriterion):
+            raise QueryException("MERGE ON requires a Criterion")
+        self._criterion = criterion
+
+    def _start_branch(self, matched: bool, condition: Criterion | None) -> None:
+        if self._pending_branch is not None:
+            raise QueryException("Complete the current MERGE branch before starting another branch")
+        if condition is not None and (not isinstance(condition, Criterion) or isinstance(condition, EmptyCriterion)):
+            raise QueryException("MERGE branch condition must be a Criterion")
+
+        scope = MergeBranch.MATCHED if matched else MergeBranch.NOT_MATCHED
+        same_scope = [branch for branch in self._branches if branch.scope == scope]
+        if condition is None and same_scope:
+            raise QueryException("Unconditional MERGE branch cannot follow another branch of the same scope")
+        if condition is not None and any(branch.condition is None for branch in same_scope):
+            raise QueryException("MERGE branch is unreachable after an unconditional branch of the same scope")
+
+        self._pending_branch = MergeBranch(matched=matched, condition=condition)
+
+    @builder
+    def when_matched(self, condition: Criterion | None = None) -> None:
+        self._start_branch(True, condition)
+
+    @builder
+    def when_not_matched(self, condition: Criterion | None = None) -> None:
+        self._start_branch(False, condition)
+
+    def _complete_branch(self, action: str) -> None:
+        branch = self._require_pending_branch()
+        branch.action = action
+        self._branches.append(branch)
+        self._pending_branch = None
+
+    def _require_pending_branch(self) -> MergeBranch:
+        if self._pending_branch is None:
+            raise QueryException("A WHEN branch is required before an action")
+        return self._pending_branch
+
+    def _current_action_branch(self, action: str) -> MergeBranch:
+        if self._pending_branch is not None:
+            if self._pending_branch.action != action:
+                raise QueryException(f"{action.upper()} action is required before continuing")
+            return self._pending_branch
+        if self._branches and self._branches[-1].action == action:
+            return self._branches[-1]
+        raise QueryException(f"A {action.upper()} branch is required")
+
+    @builder
+    def then_update(self) -> None:
+        branch = self._require_pending_branch()
+        if not branch.matched:
+            raise QueryException("UPDATE is only allowed for WHEN MATCHED branches")
+        self._complete_branch(MergeBranch.UPDATE)
+
+    @builder
+    def then_delete(self) -> None:
+        branch = self._require_pending_branch()
+        if not branch.matched:
+            raise QueryException("DELETE is only allowed for WHEN MATCHED branches")
+        self._complete_branch(MergeBranch.DELETE)
+
+    @builder
+    def then_insert(self, *columns: str | Field) -> None:
+        branch = self._require_pending_branch()
+        if branch.matched:
+            raise QueryException("INSERT is only allowed for WHEN NOT MATCHED branches")
+        if not columns:
+            raise QueryException("INSERT requires at least one column")
+
+        branch.action = MergeBranch.INSERT
+        branch.insert_columns = [self._target_field(column) for column in columns]
+        self._branches.append(branch)
+        self._pending_branch = None
+
+    @builder
+    def set(self, field: Field | str, value: Any) -> None:
+        branch = self._current_action_branch(MergeBranch.UPDATE)
+        field = self._target_field(field)
+        value = value if isinstance(value, Term) else Term.wrap_constant(value, wrapper_cls=self._wrapper_cls)
+        branch.updates.append((field, value))
+
+    @builder
+    def values(self, *values: Any) -> None:
+        branch = self._current_action_branch(MergeBranch.INSERT)
+        if not values:
+            raise QueryException("INSERT requires one value for each column")
+        if branch.insert_values is not None:
+            raise QueryException("MERGE INSERT branch can only have one VALUES row")
+        if len(values) != len(branch.insert_columns):
+            raise QueryException("Number of INSERT values must match number of columns")
+        branch.insert_values = [
+            value if isinstance(value, Term) else Term.wrap_constant(value, wrapper_cls=self._wrapper_cls)
+            for value in values
+        ]
+
+    def _target_field(self, field: Field | str) -> Field:
+        if isinstance(field, str):
+            return Field(field)
+        if isinstance(field, Field):
+            return Field(field.name)
+        raise QueryException("Expected a field name or Field")
+
+    def _set_kwargs_defaults(self, kwargs: dict[str, Any]) -> None:
+        kwargs.setdefault("quote_char", self.QUOTE_CHAR)
+        kwargs.setdefault("secondary_quote_char", self.SECONDARY_QUOTE_CHAR)
+        kwargs.setdefault("dialect", self.dialect)
+
+    def _validate(self) -> None:
+        if self._target is None:
+            raise QueryException("MERGE requires a target table")
+        if not isinstance(self._target, Table):
+            raise QueryException("MERGE target must be a table")
+        if self._source is None:
+            raise QueryException("MERGE requires a source table or subquery")
+        if self._criterion is None:
+            raise QueryException("MERGE requires an ON condition")
+        if self._pending_branch is not None:
+            raise QueryException("MERGE branch is missing an action")
+        if not self._branches:
+            raise QueryException("MERGE requires at least one branch")
+
+        for branch in self._branches:
+            if branch.action == MergeBranch.UPDATE and not branch.updates:
+                raise QueryException("MERGE UPDATE branch requires at least one SET assignment")
+            if branch.action == MergeBranch.INSERT:
+                if branch.insert_values is None:
+                    raise QueryException("MERGE INSERT branch requires VALUES")
+                if len(branch.insert_values) != len(branch.insert_columns):
+                    raise QueryException("Number of INSERT values must match number of columns")
+
+    def _get_merge_sql(self, **kwargs: Any) -> str:
+        self._validate()
+        self._set_kwargs_defaults(kwargs)
+
+        sql = "MERGE INTO {target} USING {source} ON {condition}".format(
+            target=self._target.get_sql(**kwargs),
+            source=self._source.get_sql(subquery=True, with_alias=True, **kwargs),
+            condition=self._criterion.get_sql(with_namespace=True, **kwargs),
+        )
+        return sql + " " + " ".join(self._branch_sql(branch, **kwargs) for branch in self._branches)
+
+    def get_sql(self, **kwargs: Any) -> str:
+        raise DialectNotSupported("MERGE requires a dialect-specific query builder")
+
+    def _branch_sql(self, branch: MergeBranch, **kwargs: Any) -> str:
+        sql = "WHEN MATCHED" if branch.matched else "WHEN NOT MATCHED"
+        if branch.condition is not None:
+            sql += " AND {condition}".format(
+                condition=branch.condition.get_sql(with_namespace=True, **kwargs),
+            )
+
+        if branch.action == MergeBranch.UPDATE:
+            assignments = ",".join(
+                "{field}={value}".format(
+                    field=field.get_sql(with_namespace=False, **kwargs),
+                    value=value.get_sql(with_namespace=True, **kwargs),
+                )
+                for field, value in branch.updates
+            )
+            sql += " THEN UPDATE SET {assignments}".format(assignments=assignments)
+        elif branch.action == MergeBranch.DELETE:
+            sql += " THEN DELETE"
+        else:
+            columns = ",".join(field.get_sql(with_namespace=False, **kwargs) for field in branch.insert_columns)
+            values = ",".join(value.get_sql(with_namespace=True, **kwargs) for value in branch.insert_values)
+            sql += " THEN INSERT ({columns}) VALUES ({values})".format(columns=columns, values=values)
+
+        return sql
+
+
 # for typing in Query's methods
 _TableClass = Table
 
@@ -516,6 +771,10 @@ class Query:
         :return: QueryBuilder
         """
         return cls._builder(**kwargs).update(table)
+
+    @classmethod
+    def merge(cls, table: str | Table, **kwargs: Any) -> MergeQueryBuilder:
+        raise DialectNotSupported("MERGE is not supported by this dialect") from None
 
     @classmethod
     def Table(cls, table_name: str, **kwargs) -> _TableClass:

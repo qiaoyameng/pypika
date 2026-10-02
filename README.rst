@@ -987,6 +987,33 @@ PostgreSQL
 
     INSERT INTO "customers" VALUES (1,'Jane','Doe','jane@example.com') ON CONFLICT ("email") DO UPDATE SET "email"='bob@example.com'
 
+MERGE is supported through ``PostgreSQLQuery``. The source can be a table or a subquery and branches are evaluated
+in the order they are declared. An unconditional ``WHEN MATCHED`` or ``WHEN NOT MATCHED`` branch must be the last
+branch for that scope.
+
+.. code-block:: python
+
+    customers = Table('customers')
+    updates = Query.from_(Table('customer_updates')) \
+        .select('id', 'name', 'updated_at', 'is_deleted') \
+        .as_('updates')
+
+    q = PostgreSQLQuery.merge(customers) \
+        .using(updates) \
+        .on(customers.id == Field('id', table=updates)) \
+        .when_matched(Field('is_deleted', table=updates).isnull()) \
+        .then_delete() \
+        .when_matched(Field('updated_at', table=updates) > customers.updated_at) \
+        .then_update() \
+        .set(customers.name, Field('name', table=updates)) \
+        .when_not_matched() \
+        .then_insert(customers.id, customers.name, customers.updated_at) \
+        .values(Field('id', table=updates), Field('name', table=updates), NamedParameter('now'))
+
+.. code-block:: sql
+
+    MERGE INTO "customers" USING (SELECT "id","name","updated_at","is_deleted" FROM "customer_updates") "updates" ON "customers"."id"="updates"."id" WHEN MATCHED AND "updates"."is_deleted" IS NULL THEN DELETE WHEN MATCHED AND "updates"."updated_at">"customers"."updated_at" THEN UPDATE SET "name"="updates"."name" WHEN NOT MATCHED THEN INSERT ("id","name","updated_at") VALUES ("updates"."id","updates"."name",:now)
+
 
 Insert from a SELECT Sub-query
 """"""""""""""""""""""""""""""
