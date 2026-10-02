@@ -342,8 +342,8 @@ class PostgresInsertIntoOnConflictTests(unittest.TestCase):
             PostgreSQLQuery.into(self.table_abc)
             .insert(1, "m")
             .on_conflict('id')
-            .where(self.table_abc.abc.eq(0))
-            .where(self.table_abc.cde.eq(0))
+            .where_target(self.table_abc.abc.eq(0))
+            .where_target(self.table_abc.cde.eq(0))
             .do_nothing()
         )
         self.assertEqual(
@@ -366,8 +366,8 @@ class PostgresInsertIntoOnConflictTests(unittest.TestCase):
             PostgreSQLQuery.into(self.table_abc)
             .insert(1, "m")
             .on_conflict('id')
-            .where(self.table_abc.abc.eq(0))
-            .where(self.table_abc.cde.eq(0))
+            .where_target(self.table_abc.abc.eq(0))
+            .where_target(self.table_abc.cde.eq(0))
             .do_update('field', 'val')
         )
         self.assertEqual(
@@ -385,8 +385,8 @@ class PostgresInsertIntoOnConflictTests(unittest.TestCase):
             .from_(table_bcd)
             .where(table_bcd.abc.eq('1'))
             .on_conflict('id')
-            .where(self.table_abc.abc.eq(0))
-            .where(self.table_abc.cde.eq(0))
+            .where_target(self.table_abc.abc.eq(0))
+            .where_target(self.table_abc.cde.eq(0))
             .do_update('field', 'val')
         )
 
@@ -451,8 +451,8 @@ class PostgresInsertIntoOnConflictTests(unittest.TestCase):
             .from_(table_bcd)
             .where(table_bcd.abc.eq('1'))
             .on_conflict('id')
-            .where(self.table_abc.abc.eq(0))
-            .where(self.table_abc.cde.eq(0))
+            .where_target(self.table_abc.abc.eq(0))
+            .where_target(self.table_abc.cde.eq(0))
             .do_update('field', 'val')
             .where(self.table_abc.id.eq(2))
             .where(self.table_abc.sub_id.eq(3))
@@ -462,6 +462,186 @@ class PostgresInsertIntoOnConflictTests(unittest.TestCase):
             'ON CONFLICT ("id") WHERE "abc"=0 AND "cde"=0 '
             'DO UPDATE SET "field"=\'val\' WHERE "abc"."id"=2 AND "abc"."sub_id"=3',
             str(qs),
+        )
+
+
+    def test_insert_on_conflict_index_expression(self):
+        query = (
+            PostgreSQLQuery.into(self.table_abc)
+            .insert("JANE@example.com")
+            .on_conflict(fn.Lower(self.table_abc.email))
+            .do_nothing()
+        )
+        self.assertEqual(
+            'INSERT INTO "abc" VALUES (\'JANE@example.com\') ON CONFLICT ((LOWER("email"))) DO NOTHING',
+            str(query),
+        )
+
+    def test_insert_on_conflict_mixed_column_and_index_expression(self):
+        query = (
+            PostgreSQLQuery.into(self.table_abc)
+            .insert(1, "m")
+            .on_conflict(self.table_abc.id, fn.Lower(self.table_abc.email))
+            .do_nothing()
+        )
+        self.assertEqual(
+            'INSERT INTO "abc" VALUES (1,\'m\') ON CONFLICT ("id", (LOWER("email"))) DO NOTHING',
+            str(query),
+        )
+
+    def test_insert_on_conflict_index_expression_with_parameter(self):
+        from pypika.terms import QmarkParameter
+
+        query = (
+            PostgreSQLQuery.into(self.table_abc)
+            .insert("a@example.com", 1)
+            .on_conflict(self.table_abc.email + self.table_abc.salt)
+            .do_nothing()
+        )
+        parameter = QmarkParameter()
+        sql = query.get_sql(parameter=parameter)
+        self.assertEqual(
+            'INSERT INTO "abc" VALUES (?,?) ON CONFLICT (("email"+"salt")) DO NOTHING',
+            sql,
+        )
+        self.assertEqual(["a@example.com", 1], parameter.get_parameters())
+
+    def test_insert_on_constraint_do_update(self):
+        query = (
+            PostgreSQLQuery.into(self.table_abc)
+            .insert(1, "m")
+            .on_constraint("abc_pkey")
+            .do_update("name", "m")
+        )
+        self.assertEqual(
+            'INSERT INTO "abc" VALUES (1,\'m\') ON CONFLICT ON CONSTRAINT "abc_pkey" DO UPDATE SET "name"=\'m\'',
+            str(query),
+        )
+
+    def test_insert_on_constraint_do_nothing(self):
+        query = PostgreSQLQuery.into(self.table_abc).insert(1).on_constraint("abc_pkey").do_nothing()
+        self.assertEqual(
+            'INSERT INTO "abc" VALUES (1) ON CONFLICT ON CONSTRAINT "abc_pkey" DO NOTHING',
+            str(query),
+        )
+
+    def test_on_constraint_rejects_conflict_target(self):
+        with self.assertRaises(QueryException):
+            PostgreSQLQuery.into(self.table_abc).insert(1).on_conflict(self.table_abc.id).on_constraint("abc_pkey")
+
+    def test_on_conflict_target_rejects_constraint(self):
+        with self.assertRaises(QueryException):
+            PostgreSQLQuery.into(self.table_abc).insert(1).on_constraint("abc_pkey").on_conflict(self.table_abc.id)
+
+    def test_where_target_rejected_with_constraint(self):
+        with self.assertRaises(QueryException):
+            (
+                PostgreSQLQuery.into(self.table_abc)
+                .insert(1)
+                .on_constraint("abc_pkey")
+                .where_target(self.table_abc.active.isnull())
+            )
+
+    def test_where_target_requires_on_conflict(self):
+        with self.assertRaises(QueryException):
+            PostgreSQLQuery.into(self.table_abc).insert(1).where_target(self.table_abc.active.eq(True))
+
+    def test_where_target_kept_separate_from_do_update_where(self):
+        query = (
+            PostgreSQLQuery.into(self.table_abc)
+            .insert(1, "m", True)
+            .on_conflict(self.table_abc.id)
+            .where_target(self.table_abc.active.eq(True))
+            .do_update("name", "m")
+            .where(self.table_abc.updated_by.ne(0))
+        )
+        self.assertEqual(
+            'INSERT INTO "abc" VALUES (1,\'m\',true) '
+            'ON CONFLICT ("id") WHERE "active"=true '
+            'DO UPDATE SET "name"=\'m\' WHERE "abc"."updated_by"<>0',
+            str(query),
+        )
+
+    def test_conflict_chain_order_equivalent(self):
+        expected = (
+            'INSERT INTO "abc" VALUES (1,\'m\') ON CONFLICT ("id") WHERE "active"=true '
+            'DO UPDATE SET "name"=\'m\' WHERE "abc"."rev"<>0'
+        )
+
+        target_first = (
+            PostgreSQLQuery.into(self.table_abc)
+            .insert(1, "m")
+            .on_conflict("id")
+            .where_target(self.table_abc.active.eq(True))
+            .do_update("name", "m")
+            .where(self.table_abc.rev.ne(0))
+        )
+        update_first = (
+            PostgreSQLQuery.into(self.table_abc)
+            .insert(1, "m")
+            .on_conflict("id")
+            .do_update("name", "m")
+            .where(self.table_abc.rev.ne(0))
+            .where_target(self.table_abc.active.eq(True))
+        )
+        where_first = (
+            PostgreSQLQuery.into(self.table_abc)
+            .insert(1, "m")
+            .on_conflict("id")
+            .where(self.table_abc.rev.ne(0))
+            .where_target(self.table_abc.active.eq(True))
+            .do_update("name", "m")
+        )
+
+        self.assertEqual(expected, str(target_first))
+        self.assertEqual(expected, str(update_first))
+        self.assertEqual(expected, str(where_first))
+
+    def test_on_conflict_where_is_update_where_even_without_do_update(self):
+        query = (
+            PostgreSQLQuery.into(self.table_abc)
+            .insert(1)
+            .on_conflict("id")
+            .where(self.table_abc.active.eq(True))
+            .do_update("name", "m")
+        )
+        self.assertEqual(
+            'INSERT INTO "abc" VALUES (1) ON CONFLICT ("id") DO UPDATE SET "name"=\'m\' '
+            'WHERE "abc"."active"=true',
+            str(query),
+        )
+
+    def test_conflict_branches_do_not_share_target_predicates(self):
+        base = (
+            PostgreSQLQuery.into(self.table_abc)
+            .insert(1, "m")
+            .on_conflict("id")
+            .where_target(self.table_abc.active.eq(True))
+        )
+
+        branch_a = base.do_update("name", "a").where(self.table_abc.rev.eq(1))
+        branch_b = base.do_update("name", "b")
+
+        self.assertEqual(
+            'INSERT INTO "abc" VALUES (1,\'m\') ON CONFLICT ("id") WHERE "active"=true '
+            'DO UPDATE SET "name"=\'a\' WHERE "abc"."rev"=1',
+            str(branch_a),
+        )
+        self.assertEqual(
+            'INSERT INTO "abc" VALUES (1,\'m\') ON CONFLICT ("id") WHERE "active"=true '
+            'DO UPDATE SET "name"=\'b\'',
+            str(branch_b),
+        )
+
+    def test_conflict_branches_do_not_share_target_lists(self):
+        base = PostgreSQLQuery.into(self.table_abc).insert(1)
+        branch_a = base.on_conflict("id").do_nothing()
+        branch_b = base.on_conflict("id", "sub_id").do_nothing()
+
+        self.assertEqual('INSERT INTO "abc" VALUES (1) ON CONFLICT ("id") DO NOTHING', str(branch_a))
+        self.assertEqual(
+            'INSERT INTO "abc" VALUES (1) ON CONFLICT ("id", "sub_id") DO NOTHING',
+            str(branch_b),
         )
 
 

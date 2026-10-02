@@ -987,6 +987,47 @@ PostgreSQL
 
     INSERT INTO "customers" VALUES (1,'Jane','Doe','jane@example.com') ON CONFLICT ("email") DO UPDATE SET "email"='bob@example.com'
 
+Partial indexes need the index predicate passed to ``where_target`` so that it is rendered as part of
+the conflict target. It is kept separate from the predicate of the ``DO UPDATE`` action, which continues
+to be set with ``where`` regardless of the order in which the methods are chained.
+
+.. code-block:: python
+
+    customers = Table('customers')
+
+    q = PostgreSQLQuery.into(customers) \
+        .insert(1, 'Jane', 'Doe', 'jane@example.com', True) \
+        .on_conflict(customers.email) \
+        .where_target(customers.active == True) \
+        .do_update(customers.lname, 'Doe') \
+        .where(customers.updated_by.notnull())
+
+.. code-block:: sql
+
+    INSERT INTO "customers" VALUES (1,'Jane','Doe','jane@example.com',true) ON CONFLICT ("email") WHERE "active"=true DO UPDATE SET "lname"='Doe' WHERE NOT "customers"."updated_by" IS NULL
+
+Arbitrary index expressions are accepted by ``on_conflict`` and rendered with the parentheses required
+by the grammar; named constraints are addressed with ``on_constraint``.
+
+.. code-block:: python
+
+    q = PostgreSQLQuery.into(customers) \
+        .insert('JANE@example.com') \
+        .on_conflict(Lower(customers.email)) \
+        .do_nothing()
+
+    q = PostgreSQLQuery.into(customers) \
+        .insert(1, 'Jane') \
+        .on_constraint('customers_pkey') \
+        .do_update(customers.fname, 'Jane')
+
+.. code-block:: sql
+
+    INSERT INTO "customers" VALUES ('JANE@example.com') ON CONFLICT ((LOWER("email"))) DO NOTHING
+    INSERT INTO "customers" VALUES (1,'Jane') ON CONFLICT ON CONSTRAINT "customers_pkey" DO UPDATE SET "fname"='Jane'
+
+The same partial-index upsert syntax is available through ``SQLLiteQuery``.
+
 
 Insert from a SELECT Sub-query
 """"""""""""""""""""""""""""""
