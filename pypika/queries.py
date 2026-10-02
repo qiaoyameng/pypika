@@ -555,13 +555,19 @@ class _SetOperation(Selectable, Term):
 
     Created via the functions `Query.union`,`Query.union_all`,`Query.intersect`, `Query.except_of`,`Query.minus`.
 
+    Set operations can be grouped explicitly by chaining different operation types or by passing a set operation
+    query as an operand.  Chaining the same operation type keeps a flat list, while chaining a different operation
+    type nests the current query as the left operand of a new set operation, so that mixed operations are grouped
+    in the order they are called, e.g. ``a.union(b).intersect(c)`` renders ``(A UNION B) INTERSECT C`` and
+    ``a.union(b.intersect(c))`` renders ``A UNION (B INTERSECT C)``.
+
     This class should not be instantiated directly.
     """
 
     def __init__(
         self,
-        base_query: QueryBuilder,
-        set_operation_query: QueryBuilder,
+        base_query: Selectable,
+        set_operation_query: Selectable,
         set_operation: SetOperation,
         alias: str | None = None,
         wrapper_cls: type[ValueWrapper] = ValueWrapper,
@@ -576,13 +582,42 @@ class _SetOperation(Selectable, Term):
 
         self._wrapper_cls = wrapper_cls
 
+    def __copy__(self) -> _SetOperation:
+        newone = type(self).__new__(type(self))
+        newone.__dict__.update(self.__dict__)
+        newone._set_operation = copy(self._set_operation)
+        newone._orderbys = copy(self._orderbys)
+        return newone
+
+    @property
+    def _root_query(self) -> QueryBuilder:
+        """
+        The innermost QueryBuilder of this set operation, used for dialect, quoting and wrapping settings.
+        """
+        query = self.base_query
+        while isinstance(query, _SetOperation):
+            query = query.base_query
+        return query
+
+    @staticmethod
+    def _select_count(selectable: Selectable) -> int | None:
+        """
+        The number of columns a set operation operand selects, or None when it cannot be determined.
+        """
+        query = selectable
+        while isinstance(query, _SetOperation):
+            query = query.base_query
+        if isinstance(query, QueryBuilder):
+            return len(query._selects)
+        return None
+
     @builder
     def orderby(self, *fields: Field, **kwargs: Any) -> None:
         for field in fields:
             field = (
-                Field(field, table=self.base_query._from[0])
+                Field(field, table=self._root_query._from[0])
                 if isinstance(field, str)
-                else self.base_query.wrap_constant(field)
+                else self._root_query.wrap_constant(field)
             )
 
             self._orderbys.append((field, kwargs.get("order")))
@@ -595,25 +630,34 @@ class _SetOperation(Selectable, Term):
     def offset(self, offset: int) -> None:
         self._offset = offset
 
-    @builder
-    def union(self, other: Selectable) -> None:
-        self._set_operation.append((SetOperation.union, other))
+    def _add_set_operation(self, set_operation: SetOperation, other: Selectable) -> _SetOperation | None:
+        # Chaining a different set operation type nests the current query as the left operand of a new set
+        # operation, giving explicit left-to-right grouping for mixed operations.  Chaining the same type
+        # keeps the flat list so that e.g. pure UNION chains render unchanged.
+        if self._set_operation and self._set_operation[-1][0] != set_operation:
+            return _SetOperation(self, other, set_operation, wrapper_cls=self._wrapper_cls)
+        self._set_operation.append((set_operation, other))
+        return None
 
     @builder
-    def union_all(self, other: Selectable) -> None:
-        self._set_operation.append((SetOperation.union_all, other))
+    def union(self, other: Selectable) -> _SetOperation | None:
+        return self._add_set_operation(SetOperation.union, other)
 
     @builder
-    def intersect(self, other: Selectable) -> None:
-        self._set_operation.append((SetOperation.intersect, other))
+    def union_all(self, other: Selectable) -> _SetOperation | None:
+        return self._add_set_operation(SetOperation.union_all, other)
 
     @builder
-    def except_of(self, other: Selectable) -> None:
-        self._set_operation.append((SetOperation.except_of, other))
+    def intersect(self, other: Selectable) -> _SetOperation | None:
+        return self._add_set_operation(SetOperation.intersect, other)
 
     @builder
-    def minus(self, other: Selectable) -> None:
-        self._set_operation.append((SetOperation.minus, other))
+    def except_of(self, other: Selectable) -> _SetOperation | None:
+        return self._add_set_operation(SetOperation.except_of, other)
+
+    @builder
+    def minus(self, other: Selectable) -> _SetOperation | None:
+        return self._add_set_operation(SetOperation.minus, other)
 
     def __add__(self, other: Selectable) -> _SetOperation:
         return self.union(other)
@@ -621,29 +665,44 @@ class _SetOperation(Selectable, Term):
     def __mul__(self, other: Selectable) -> _SetOperation:
         return self.union_all(other)
 
-    def __sub__(self, other: QueryBuilder) -> _SetOperation:
+    def __sub__(self, other: Selectable) -> _SetOperation:
         return self.minus(other)
 
     def __str__(self) -> str:
         return self.get_sql()
 
+    def _operand_sql(self, operand: Selectable, **kwargs: Any) -> str:
+        root_query = self._root_query
+        if isinstance(operand, _SetOperation):
+            if root_query.wrap_set_operation_queries:
+                return operand.get_sql(subquery=True, **kwargs)
+            # Dialects which do not accept parenthesized set operation operands (e.g. SQLite, ClickHouse)
+            # cannot render a grouped set operation directly, so a derived table is used as a legal form
+            # instead.
+            return "SELECT * FROM ({query})".format(query=operand.get_sql(**kwargs))
+        return operand.get_sql(subquery=root_query.wrap_set_operation_queries, **kwargs)
+
     def get_sql(self, with_alias: bool = False, subquery: bool = False, **kwargs: Any) -> str:
         set_operation_template = " {type} {query_string}"
 
-        kwargs.setdefault("dialect", self.base_query.dialect)
+        kwargs.setdefault("dialect", self._root_query.dialect)
         # This initializes the quote char based on the base query, which could be a dialect specific query class
         # This might be overridden if quote_char is set explicitly in kwargs
-        kwargs.setdefault("quote_char", self.base_query.QUOTE_CHAR)
+        kwargs.setdefault("quote_char", self._root_query.QUOTE_CHAR)
 
-        base_querystring = self.base_query.get_sql(subquery=self.base_query.wrap_set_operation_queries, **kwargs)
+        base_querystring = self._operand_sql(self.base_query, **kwargs)
+        base_select_count = self._select_count(self.base_query)
 
         querystring = base_querystring
         for set_operation, set_operation_query in self._set_operation:
-            set_operation_querystring = set_operation_query.get_sql(
-                subquery=self.base_query.wrap_set_operation_queries, **kwargs
-            )
+            set_operation_querystring = self._operand_sql(set_operation_query, **kwargs)
 
-            if len(self.base_query._selects) != len(set_operation_query._selects):
+            set_operation_select_count = self._select_count(set_operation_query)
+            if (
+                base_select_count is not None
+                and set_operation_select_count is not None
+                and base_select_count != set_operation_select_count
+            ):
                 raise SetOperationException(
                     "Queries must have an equal number of select statements in a set operation."
                     "\n\nMain Query:\n{query1}\n\nSet Operations Query:\n{query2}".format(
@@ -682,7 +741,7 @@ class _SetOperation(Selectable, Term):
         the alias, otherwise the field will be rendered as SQL.
         """
         clauses = []
-        selected_aliases = {s.alias for s in self.base_query._selects}
+        selected_aliases = {s.alias for s in self._root_query._selects}
         for field, directionality in self._orderbys:
             term = (
                 format_quotes(field.alias, quote_char)
@@ -1095,23 +1154,23 @@ class QueryBuilder(Selectable, Term):
         self._offset = offset
 
     @builder
-    def union(self, other: QueryBuilder) -> _SetOperation:
+    def union(self, other: Selectable) -> _SetOperation:
         return _SetOperation(self, other, SetOperation.union, wrapper_cls=self._wrapper_cls)
 
     @builder
-    def union_all(self, other: QueryBuilder) -> _SetOperation:
+    def union_all(self, other: Selectable) -> _SetOperation:
         return _SetOperation(self, other, SetOperation.union_all, wrapper_cls=self._wrapper_cls)
 
     @builder
-    def intersect(self, other: QueryBuilder) -> _SetOperation:
+    def intersect(self, other: Selectable) -> _SetOperation:
         return _SetOperation(self, other, SetOperation.intersect, wrapper_cls=self._wrapper_cls)
 
     @builder
-    def except_of(self, other: QueryBuilder) -> _SetOperation:
+    def except_of(self, other: Selectable) -> _SetOperation:
         return _SetOperation(self, other, SetOperation.except_of, wrapper_cls=self._wrapper_cls)
 
     @builder
-    def minus(self, other: QueryBuilder) -> _SetOperation:
+    def minus(self, other: Selectable) -> _SetOperation:
         return _SetOperation(self, other, SetOperation.minus, wrapper_cls=self._wrapper_cls)
 
     @builder
@@ -1121,13 +1180,13 @@ class QueryBuilder(Selectable, Term):
             value = self.wrap_constant(value, wrapper_cls=self._wrapper_cls)
         self._updates.append((field, value))
 
-    def __add__(self, other: QueryBuilder) -> _SetOperation:
+    def __add__(self, other: Selectable) -> _SetOperation:
         return self.union(other)
 
-    def __mul__(self, other: QueryBuilder) -> _SetOperation:
+    def __mul__(self, other: Selectable) -> _SetOperation:
         return self.union_all(other)
 
-    def __sub__(self, other: QueryBuilder) -> _SetOperation:
+    def __sub__(self, other: Selectable) -> _SetOperation:
         return self.minus(other)
 
     @builder

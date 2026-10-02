@@ -661,6 +661,34 @@ To create a except query, use the ``Query.except_of()`` method.
 
     SELECT "created_time","foo","bar" FROM "provider_a" EXCEPT SELECT "created_time","fiz","buz" FROM "provider_b"
 
+Grouping set operations
+"""""""""""""""""""""""
+
+When mixing different set operations, the grouping can be controlled explicitly.  Chaining a different set
+operation nests the queries built so far as the left operand, while passing a set operation query as an operand
+nests it on the right, so that e.g. ``(A UNION B) INTERSECT C`` and ``A UNION (B INTERSECT C)`` can both be
+expressed.  Chaining the same set operation keeps a flat list, so pure ``UNION`` chains are rendered unchanged.
+
+.. code-block:: python
+
+    provider_a, provider_b, provider_c = Tables('provider_a', 'provider_b', 'provider_c')
+    a = Query.from_(provider_a).select(provider_a.created_time)
+    b = Query.from_(provider_b).select(provider_b.created_time)
+    c = Query.from_(provider_c).select(provider_c.created_time)
+
+    left_grouped = a.union(b).intersect(c)
+    right_grouped = a.union(b.intersect(c))
+
+.. code-block:: sql
+
+    ((SELECT "created_time" FROM "provider_a") UNION (SELECT "created_time" FROM "provider_b")) INTERSECT (SELECT "created_time" FROM "provider_c")
+    (SELECT "created_time" FROM "provider_a") UNION ((SELECT "created_time" FROM "provider_b") INTERSECT (SELECT "created_time" FROM "provider_c"))
+
+Each set operation node keeps its own ``ALL``/``DISTINCT`` semantics, and its own ``ORDER BY``, ``LIMIT`` and
+``OFFSET`` clauses, which are rendered inside the group they belong to.  Dialects which do not accept
+parenthesized set operation operands, such as SQLite and ClickHouse, render a grouped set operation as a
+derived table instead.
+
 Date, Time, and Intervals
 """""""""""""""""""""""""
 

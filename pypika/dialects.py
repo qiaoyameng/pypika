@@ -949,7 +949,9 @@ class SQLLiteQuery(Query):
 
     @classmethod
     def _builder(cls, **kwargs: Any) -> SQLLiteQueryBuilder:
-        return SQLLiteQueryBuilder(**kwargs)
+        # SQLite does not accept parenthesized set operation operands, so they are rendered without
+        # parentheses and grouped set operations are rendered as a derived table.
+        return SQLLiteQueryBuilder(wrap_set_operation_queries=False, **kwargs)
 
 
 class SQLLiteQueryBuilder(QueryBuilder):

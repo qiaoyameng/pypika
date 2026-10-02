@@ -1,13 +1,17 @@
+import sqlite3
 import unittest
 
 from pypika import (
+    ClickHouseQuery,
     SYSTEM_TIME,
     Field,
     Interval,
     JoinException,
     JoinType,
     MySQLQuery,
+    Parameter,
     Query,
+    SQLLiteQuery,
     SetOperationException,
     Table,
     Tables,
@@ -1168,3 +1172,178 @@ class ExceptOfTests(unittest.TestCase):
             "SELECT AVG(sq0.t) FROM ((SELECT t FROM abc) EXCEPT (SELECT t FROM efg)) sq0",
             q.get_sql(quote_char=None),
         )
+
+
+class SetOperationGroupingTests(unittest.TestCase):
+    table1, table2, table3 = Tables("abc", "efg", "hij")
+
+    def _queries(self, query_cls=Query):
+        return (
+            query_cls.from_(self.table1).select(self.table1.foo),
+            query_cls.from_(self.table2).select(self.table2.bar),
+            query_cls.from_(self.table3).select(self.table3.baz),
+        )
+
+    def test_left_grouping_renders_parenthesized_group(self):
+        query1, query2, query3 = self._queries()
+
+        self.assertEqual(
+            '((SELECT "foo" FROM "abc") UNION (SELECT "bar" FROM "efg")) INTERSECT (SELECT "baz" FROM "hij")',
+            str(query1.union(query2).intersect(query3)),
+        )
+
+    def test_right_grouping_renders_parenthesized_operand(self):
+        query1, query2, query3 = self._queries()
+
+        self.assertEqual(
+            '(SELECT "foo" FROM "abc") UNION ((SELECT "bar" FROM "efg") INTERSECT (SELECT "baz" FROM "hij"))',
+            str(query1.union(query2.intersect(query3))),
+        )
+
+    def test_grouping_on_both_sides(self):
+        query1, query2, query3 = self._queries()
+        query4 = Query.from_(self.table3).select(self.table3.baz)
+
+        self.assertEqual(
+            '((SELECT "foo" FROM "abc") UNION (SELECT "bar" FROM "efg")) '
+            'INTERSECT '
+            '((SELECT "baz" FROM "hij") EXCEPT (SELECT "baz" FROM "hij"))',
+            str(query1.union(query2).intersect(query3.except_of(query4))),
+        )
+
+    def test_pure_union_chain_is_not_grouped(self):
+        query1, query2, query3 = self._queries()
+
+        self.assertEqual(
+            '(SELECT "foo" FROM "abc") UNION (SELECT "bar" FROM "efg") UNION (SELECT "baz" FROM "hij")',
+            str(query1.union(query2).union(query3)),
+        )
+
+    def test_pure_intersect_chain_is_not_grouped(self):
+        query1, query2, query3 = self._queries()
+
+        self.assertEqual(
+            '(SELECT "foo" FROM "abc") INTERSECT (SELECT "bar" FROM "efg") INTERSECT (SELECT "baz" FROM "hij")',
+            str(query1.intersect(query2).intersect(query3)),
+        )
+
+    def test_each_node_keeps_its_own_all_distinct_semantics(self):
+        query1, query2, query3 = self._queries()
+
+        self.assertEqual(
+            '((SELECT "foo" FROM "abc") UNION ALL (SELECT "bar" FROM "efg")) UNION (SELECT "baz" FROM "hij")',
+            str(query1.union_all(query2).union(query3)),
+        )
+        self.assertEqual(
+            '(SELECT "foo" FROM "abc") UNION ALL ((SELECT "bar" FROM "efg") UNION (SELECT "baz" FROM "hij"))',
+            str(query1.union_all(query2.union(query3))),
+        )
+
+    def test_order_by_and_limit_are_scoped_to_their_own_node(self):
+        query1, query2, query3 = self._queries()
+
+        inner = query1.union(query2).orderby("foo").limit(5)
+        grouped = inner.intersect(query3).orderby("foo").limit(10)
+
+        self.assertEqual(
+            '((SELECT "foo" FROM "abc") UNION (SELECT "bar" FROM "efg") ORDER BY "foo" LIMIT 5) '
+            'INTERSECT '
+            '(SELECT "baz" FROM "hij") ORDER BY "foo" LIMIT 10',
+            str(grouped),
+        )
+
+    def test_require_equal_number_of_fields_with_nested_operand(self):
+        query1, query2, _ = self._queries()
+        query3 = Query.from_(self.table3).select(self.table3.baz, self.table3.buz)
+
+        with self.assertRaises(SetOperationException):
+            str(query1.union(query2.intersect(query3)))
+        with self.assertRaises(SetOperationException):
+            str(query1.union(query2).intersect(query3))
+
+    def test_alias_of_nested_operand_is_not_rendered(self):
+        query1, query2, query3 = self._queries()
+
+        nested = query2.intersect(query3).as_("nested")
+
+        self.assertEqual(
+            '(SELECT "foo" FROM "abc") UNION ((SELECT "bar" FROM "efg") INTERSECT (SELECT "baz" FROM "hij"))',
+            str(query1.union(nested)),
+        )
+
+    def test_parameters_are_scoped_to_their_own_subquery(self):
+        query1 = Query.from_(self.table1).select(self.table1.foo).where(self.table1.fiz == Parameter(":p1"))
+        query2 = Query.from_(self.table2).select(self.table2.bar).where(self.table2.buz == Parameter(":p2"))
+        query3 = Query.from_(self.table3).select(self.table3.baz)
+
+        self.assertEqual(
+            '((SELECT "foo" FROM "abc" WHERE "fiz"=:p1) UNION (SELECT "bar" FROM "efg" WHERE "buz"=:p2)) '
+            'INTERSECT '
+            '(SELECT "baz" FROM "hij")',
+            str(query1.union(query2).intersect(query3)),
+        )
+
+    def test_chained_queries_are_immutable(self):
+        query1, query2, query3 = self._queries()
+
+        union_query = query1.union(query2)
+        union_query.union(query3)
+        union_query.intersect(query3)
+
+        self.assertEqual('(SELECT "foo" FROM "abc") UNION (SELECT "bar" FROM "efg")', str(union_query))
+
+    def test_mysql_query_wraps_grouped_queries(self):
+        query1, query2, query3 = self._queries(MySQLQuery)
+
+        self.assertEqual(
+            "((SELECT `foo` FROM `abc`) UNION (SELECT `bar` FROM `efg`)) INTERSECT (SELECT `baz` FROM `hij`)",
+            str(query1.union(query2).intersect(query3)),
+        )
+
+    def test_clickhouse_query_uses_derived_table_for_grouping(self):
+        query1, query2, query3 = self._queries(ClickHouseQuery)
+
+        self.assertEqual(
+            'SELECT * FROM (SELECT "foo" FROM "abc" UNION ALL SELECT "bar" FROM "efg") '
+            'INTERSECT '
+            'SELECT "baz" FROM "hij"',
+            str(query1.union_all(query2).intersect(query3)),
+        )
+
+    def test_sqllite_query_uses_derived_table_for_grouping(self):
+        query1, query2, query3 = self._queries(SQLLiteQuery)
+
+        self.assertEqual(
+            'SELECT * FROM (SELECT "foo" FROM "abc" UNION SELECT "bar" FROM "efg") '
+            'INTERSECT '
+            'SELECT "baz" FROM "hij"',
+            str(query1.union(query2).intersect(query3)),
+        )
+
+    def test_sqllite_grouping_results_differ_on_sqlite(self):
+        connection = sqlite3.connect(":memory:")
+        try:
+            connection.executescript(
+                'CREATE TABLE abc(foo);'
+                'CREATE TABLE efg(bar);'
+                'CREATE TABLE hij(baz);'
+                'INSERT INTO abc VALUES (1),(2),(3);'
+                'INSERT INTO efg VALUES (2),(3),(4);'
+                'INSERT INTO hij VALUES (3),(4),(5);'
+            )
+            query1, query2, query3 = self._queries(SQLLiteQuery)
+
+            left_grouped = str(query1.union(query2).intersect(query3))
+            right_grouped = str(query1.union(query2.intersect(query3)))
+            union_chain = str(query1.union(query2).union(query3))
+
+            left_rows = sorted(row[0] for row in connection.execute(left_grouped))
+            right_rows = sorted(row[0] for row in connection.execute(right_grouped))
+            chain_rows = sorted(row[0] for row in connection.execute(union_chain))
+
+            self.assertEqual([3, 4], left_rows)
+            self.assertEqual([1, 2, 3, 4], right_rows)
+            self.assertNotEqual(left_rows, right_rows)
+            self.assertEqual([1, 2, 3, 4, 5], chain_rows)
+        finally:
+            connection.close()
