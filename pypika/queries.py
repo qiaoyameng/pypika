@@ -549,6 +549,138 @@ class Query:
         return make_tables(*names, **kwargs)
 
 
+class _GroupedSetOperation(Selectable, Term):
+    def __init__(self, query: _SetOperation, alias: str | None = None) -> None:
+        super().__init__(alias or query.alias)
+        self.query = query
+
+    def __copy__(self) -> _GroupedSetOperation:
+        newone = type(self).__new__(type(self))
+        newone.__dict__.update(self.__dict__)
+        return newone
+
+    @property
+    def dialect(self) -> Dialects | None:
+        return self.query.dialect
+
+    @property
+    def QUOTE_CHAR(self) -> str | None:
+        return self.query.QUOTE_CHAR
+
+    @property
+    def wrap_set_operation_queries(self) -> bool:
+        return self.query.wrap_set_operation_queries
+
+    @property
+    def wrap_grouped_set_operation_queries(self) -> bool:
+        return self.query.wrap_grouped_set_operation_queries
+
+    @property
+    def _table_name(self) -> str:
+        return self.alias
+
+    @property
+    def _selects(self) -> list[Any]:
+        return self.query._selects
+
+    @property
+    def _from(self) -> list[Selectable]:
+        return self.query.base_query._from
+
+    def nodes_(self):
+        yield self
+        yield from self.query.nodes_()
+
+    def union(self, other: Selectable, union_all: bool = False) -> _SetOperation:
+        operation = _SetOperation(
+            self,
+            other,
+            SetOperation.union_all if union_all else SetOperation.union,
+            wrapper_cls=self.query._wrapper_cls,
+            wrap_grouped_set_operation_queries=self.query.wrap_grouped_set_operation_queries,
+        )
+        return operation
+
+    def union_all(self, other: Selectable) -> _SetOperation:
+        return self.union(other, union_all=True)
+
+    def intersect(self, other: Selectable) -> _SetOperation:
+        return _SetOperation(
+            self,
+            other,
+            SetOperation.intersect,
+            wrapper_cls=self.query._wrapper_cls,
+            wrap_grouped_set_operation_queries=self.query.wrap_grouped_set_operation_queries,
+        )
+
+    def except_of(self, other: Selectable) -> _SetOperation:
+        return _SetOperation(
+            self,
+            other,
+            SetOperation.except_of,
+            wrapper_cls=self.query._wrapper_cls,
+            wrap_grouped_set_operation_queries=self.query.wrap_grouped_set_operation_queries,
+        )
+
+    def minus(self, other: Selectable) -> _SetOperation:
+        return _SetOperation(
+            self,
+            other,
+            SetOperation.minus,
+            wrapper_cls=self.query._wrapper_cls,
+            wrap_grouped_set_operation_queries=self.query.wrap_grouped_set_operation_queries,
+        )
+
+    def __add__(self, other: Selectable) -> _SetOperation:
+        return self.union(other)
+
+    def __mul__(self, other: Selectable) -> _SetOperation:
+        return self.union_all(other)
+
+    def __sub__(self, other: Selectable) -> _SetOperation:
+        return self.minus(other)
+
+    def get_sql(
+        self,
+        with_alias: bool = False,
+        subquery: bool = False,
+        **kwargs: Any,
+    ) -> str:
+        querystring = self.query.get_sql(**kwargs)
+
+        if self.wrap_grouped_set_operation_queries:
+            querystring = "({query})".format(query=querystring)
+        else:
+            querystring = "(SELECT * FROM ({query}) set_operation_operand)".format(query=querystring)
+
+        if with_alias:
+            return format_alias_sql(querystring, self.alias, **kwargs)
+
+        return querystring
+
+    @staticmethod
+    def _set_operation_cte_name(alias: str | None, index: int | None = None) -> str:
+        if alias:
+            return alias
+        if index is None:
+            return "set_operation_operand"
+        return "set_operation_operand_{index}".format(index=index)
+
+    def get_set_operation_sql(self, index: int | None = None, **kwargs: Any) -> tuple[str, str, str]:
+        querystring = self.query.get_sql(**kwargs)
+
+        if self.wrap_grouped_set_operation_queries:
+            return "", "", "({query})".format(query=querystring)
+
+        if self.dialect is not Dialects.SQLLITE:
+            return "", "", "(SELECT * FROM ({query}) set_operation_operand)".format(query=querystring)
+
+        cte_name = self._set_operation_cte_name(self.alias, index)
+        columns = ",".join(term.get_sql(**kwargs) for term in self.query.base_query._selects)
+        reference = "SELECT {columns} FROM {name}".format(columns=columns, name=cte_name)
+        return cte_name, querystring, reference
+
+
 class _SetOperation(Selectable, Term):
     """
     A Query class wrapper for a all set operations, Union DISTINCT or ALL, Intersect, Except or Minus
@@ -560,11 +692,12 @@ class _SetOperation(Selectable, Term):
 
     def __init__(
         self,
-        base_query: QueryBuilder,
-        set_operation_query: QueryBuilder,
+        base_query: Selectable,
+        set_operation_query: Selectable,
         set_operation: SetOperation,
         alias: str | None = None,
         wrapper_cls: type[ValueWrapper] = ValueWrapper,
+        wrap_grouped_set_operation_queries: bool | None = None,
     ):
         super().__init__(alias)
         self.base_query = base_query
@@ -575,6 +708,57 @@ class _SetOperation(Selectable, Term):
         self._offset = None
 
         self._wrapper_cls = wrapper_cls
+        self.wrap_grouped_set_operation_queries = (
+            getattr(base_query, "wrap_grouped_set_operation_queries", True)
+            if wrap_grouped_set_operation_queries is None
+            else wrap_grouped_set_operation_queries
+        )
+        self._set_operation_ctes = []
+        self._set_operation_cte_index = 0
+
+    def __copy__(self) -> _SetOperation:
+        newone = type(self).__new__(type(self))
+        newone.__dict__.update(self.__dict__)
+        newone._set_operation = copy(self._set_operation)
+        newone._orderbys = copy(self._orderbys)
+        newone._set_operation_ctes = copy(self._set_operation_ctes)
+        return newone
+
+    @property
+    def dialect(self) -> Dialects | None:
+        return self.base_query.dialect
+
+    @property
+    def QUOTE_CHAR(self) -> str | None:
+        return getattr(self.base_query, "QUOTE_CHAR", '"')
+
+    @property
+    def wrap_set_operation_queries(self) -> bool:
+        return getattr(self.base_query, "wrap_set_operation_queries", True)
+
+    @property
+    def _table_name(self) -> str:
+        return self.alias
+
+    @property
+    def _selects(self) -> list[Any]:
+        return self.base_query._selects
+
+    def _column_count(self, query: Selectable) -> int | None:
+        if any(isinstance(select, Star) for select in query._selects):
+            return None
+        return len(query._selects)
+
+    def grouped(self) -> _GroupedSetOperation:
+        return _GroupedSetOperation(self)
+
+    parenthesize = grouped
+
+    def nodes_(self):
+        yield self
+        yield from self.base_query.nodes_()
+        for _, query in self._set_operation:
+            yield from query.nodes_()
 
     @builder
     def orderby(self, *fields: Field, **kwargs: Any) -> None:
@@ -596,23 +780,23 @@ class _SetOperation(Selectable, Term):
         self._offset = offset
 
     @builder
-    def union(self, other: Selectable) -> None:
+    def union(self, other: Selectable) -> _SetOperation:
         self._set_operation.append((SetOperation.union, other))
 
     @builder
-    def union_all(self, other: Selectable) -> None:
+    def union_all(self, other: Selectable) -> _SetOperation:
         self._set_operation.append((SetOperation.union_all, other))
 
     @builder
-    def intersect(self, other: Selectable) -> None:
+    def intersect(self, other: Selectable) -> _SetOperation:
         self._set_operation.append((SetOperation.intersect, other))
 
     @builder
-    def except_of(self, other: Selectable) -> None:
+    def except_of(self, other: Selectable) -> _SetOperation:
         self._set_operation.append((SetOperation.except_of, other))
 
     @builder
-    def minus(self, other: Selectable) -> None:
+    def minus(self, other: Selectable) -> _SetOperation:
         self._set_operation.append((SetOperation.minus, other))
 
     def __add__(self, other: Selectable) -> _SetOperation:
@@ -627,23 +811,36 @@ class _SetOperation(Selectable, Term):
     def __str__(self) -> str:
         return self.get_sql()
 
-    def get_sql(self, with_alias: bool = False, subquery: bool = False, **kwargs: Any) -> str:
+    def get_sql(
+        self,
+        with_alias: bool = False,
+        subquery: bool = False,
+        set_operand: bool = False,
+        **kwargs: Any,
+    ) -> str:
         set_operation_template = " {type} {query_string}"
 
-        kwargs.setdefault("dialect", self.base_query.dialect)
+        kwargs.setdefault("dialect", self.dialect)
         # This initializes the quote char based on the base query, which could be a dialect specific query class
         # This might be overridden if quote_char is set explicitly in kwargs
-        kwargs.setdefault("quote_char", self.base_query.QUOTE_CHAR)
+        kwargs.setdefault("quote_char", self.QUOTE_CHAR)
 
-        base_querystring = self.base_query.get_sql(subquery=self.base_query.wrap_set_operation_queries, **kwargs)
+        base_querystring = self._operand_sql(self.base_query, is_base=True, **kwargs)
+        base_column_count = self._column_count(self.base_query)
 
         querystring = base_querystring
+        grouped_operand_index = self._set_operation_cte_index
         for set_operation, set_operation_query in self._set_operation:
-            set_operation_querystring = set_operation_query.get_sql(
-                subquery=self.base_query.wrap_set_operation_queries, **kwargs
-            )
+            if isinstance(set_operation_query, _GroupedSetOperation):
+                grouped_operand_index += 1
+            set_operation_querystring = self._operand_sql(set_operation_query, index=grouped_operand_index, **kwargs)
 
-            if len(self.base_query._selects) != len(set_operation_query._selects):
+            set_operation_column_count = self._column_count(set_operation_query)
+            if (
+                base_column_count is not None
+                and set_operation_column_count is not None
+                and base_column_count != set_operation_column_count
+            ):
                 raise SetOperationException(
                     "Queries must have an equal number of select statements in a set operation."
                     "\n\nMain Query:\n{query1}\n\nSet Operations Query:\n{query2}".format(
@@ -655,6 +852,12 @@ class _SetOperation(Selectable, Term):
                 type=set_operation.value, query_string=set_operation_querystring
             )
 
+        if set_operand:
+            if self.wrap_grouped_set_operation_queries:
+                querystring = "({query})".format(query=querystring)
+            else:
+                querystring = self._derived_table_sql(querystring)
+
         if self._orderbys:
             querystring += self._orderby_sql(**kwargs)
 
@@ -664,6 +867,12 @@ class _SetOperation(Selectable, Term):
         if self._offset:
             querystring += self._offset_sql()
 
+        if self._set_operation_ctes:
+            common_table_expressions = ", ".join(
+                "{name} AS ({body})".format(name=name, body=body) for name, body in self._set_operation_ctes
+            )
+            querystring = "WITH {ctes} {query}".format(ctes=common_table_expressions, query=querystring)
+
         if subquery:
             querystring = "({query})".format(query=querystring, **kwargs)
 
@@ -671,6 +880,35 @@ class _SetOperation(Selectable, Term):
             return format_alias_sql(querystring, self.alias or self._table_name, **kwargs)
 
         return querystring
+
+    def _operand_sql(self, query: Selectable, is_base: bool = False, index: int | None = None, **kwargs: Any) -> str:
+        if isinstance(query, _GroupedSetOperation):
+            if is_base:
+                self._set_operation_cte_index += 1
+                index = self._set_operation_cte_index
+
+            cte_name, cte_body, querystring = query.get_set_operation_sql(index=index, **kwargs)
+            if cte_name:
+                self._set_operation_ctes.append((cte_name, cte_body))
+            return querystring
+
+        if isinstance(query, _SetOperation):
+            return query.get_sql(set_operand=True, **kwargs)
+
+        if self.wrap_set_operation_queries:
+            return query.get_sql(subquery=True, **kwargs)
+
+        if self.dialect is Dialects.SQLLITE and not (query._orderbys or query._limit is not None or query._offset):
+            return query.get_sql(**kwargs)
+
+        if query._orderbys or query._limit is not None or query._offset:
+            return self._derived_table_sql(query.get_sql(**kwargs))
+
+        return query.get_sql(**kwargs)
+
+    @staticmethod
+    def _derived_table_sql(querystring: str) -> str:
+        return "(SELECT * FROM ({query}) set_operation_operand)".format(query=querystring)
 
     def _orderby_sql(self, quote_char: str | None = None, **kwargs: Any) -> str:
         """
@@ -719,6 +957,7 @@ class QueryBuilder(Selectable, Term):
         self,
         dialect: Dialects | None = None,
         wrap_set_operation_queries: bool = True,
+        wrap_grouped_set_operation_queries: bool = True,
         wrapper_cls: type[ValueWrapper] = ValueWrapper,
         immutable: bool = True,
         as_keyword: bool = False,
@@ -769,6 +1008,7 @@ class QueryBuilder(Selectable, Term):
         self.dialect = dialect
         self.as_keyword = as_keyword
         self.wrap_set_operation_queries = wrap_set_operation_queries
+        self.wrap_grouped_set_operation_queries = wrap_grouped_set_operation_queries
 
         self._wrapper_cls = wrapper_cls
 
@@ -790,6 +1030,7 @@ class QueryBuilder(Selectable, Term):
         newone._updates = copy(self._updates)
         newone._force_indexes = copy(self._force_indexes)
         newone._use_indexes = copy(self._use_indexes)
+        newone.wrap_grouped_set_operation_queries = self.wrap_grouped_set_operation_queries
         return newone
 
     @builder
@@ -1095,23 +1336,23 @@ class QueryBuilder(Selectable, Term):
         self._offset = offset
 
     @builder
-    def union(self, other: QueryBuilder) -> _SetOperation:
+    def union(self, other: Selectable) -> _SetOperation:
         return _SetOperation(self, other, SetOperation.union, wrapper_cls=self._wrapper_cls)
 
     @builder
-    def union_all(self, other: QueryBuilder) -> _SetOperation:
+    def union_all(self, other: Selectable) -> _SetOperation:
         return _SetOperation(self, other, SetOperation.union_all, wrapper_cls=self._wrapper_cls)
 
     @builder
-    def intersect(self, other: QueryBuilder) -> _SetOperation:
+    def intersect(self, other: Selectable) -> _SetOperation:
         return _SetOperation(self, other, SetOperation.intersect, wrapper_cls=self._wrapper_cls)
 
     @builder
-    def except_of(self, other: QueryBuilder) -> _SetOperation:
+    def except_of(self, other: Selectable) -> _SetOperation:
         return _SetOperation(self, other, SetOperation.except_of, wrapper_cls=self._wrapper_cls)
 
     @builder
-    def minus(self, other: QueryBuilder) -> _SetOperation:
+    def minus(self, other: Selectable) -> _SetOperation:
         return _SetOperation(self, other, SetOperation.minus, wrapper_cls=self._wrapper_cls)
 
     @builder
@@ -1121,13 +1362,13 @@ class QueryBuilder(Selectable, Term):
             value = self.wrap_constant(value, wrapper_cls=self._wrapper_cls)
         self._updates.append((field, value))
 
-    def __add__(self, other: QueryBuilder) -> _SetOperation:
+    def __add__(self, other: Selectable) -> _SetOperation:
         return self.union(other)
 
-    def __mul__(self, other: QueryBuilder) -> _SetOperation:
+    def __mul__(self, other: Selectable) -> _SetOperation:
         return self.union_all(other)
 
-    def __sub__(self, other: QueryBuilder) -> _SetOperation:
+    def __sub__(self, other: Selectable) -> _SetOperation:
         return self.minus(other)
 
     @builder

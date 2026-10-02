@@ -1,6 +1,10 @@
 import unittest
 
+import sqlite3
+
 from pypika import (
+    ClickHouseQuery,
+    SQLLiteQuery,
     SYSTEM_TIME,
     Field,
     Interval,
@@ -875,6 +879,160 @@ class UnionTests(unittest.TestCase):
             "SELECT AVG(sq0.t) FROM ((SELECT t FROM abc) UNION (SELECT t FROM efg)) sq0",
             q.get_sql(quote_char=None),
         )
+
+
+class SetOperationGroupingTests(unittest.TestCase):
+    def test_left_grouped_union_then_intersect(self):
+        query_a = Query.from_("a").select("v")
+        query_b = Query.from_("b").select("v")
+        query_c = Query.from_("c").select("v")
+
+        query = query_a.union(query_b).grouped().intersect(query_c)
+
+        self.assertEqual(
+            '((SELECT "v" FROM "a") UNION (SELECT "v" FROM "b")) INTERSECT (SELECT "v" FROM "c")',
+            str(query),
+        )
+
+    def test_right_grouped_intersect_then_union(self):
+        query_a = Query.from_("a").select("v")
+        query_b = Query.from_("b").select("v")
+        query_c = Query.from_("c").select("v")
+
+        query = query_a.union(query_b.intersect(query_c).grouped())
+
+        self.assertEqual(
+            '(SELECT "v" FROM "a") UNION ((SELECT "v" FROM "b") INTERSECT (SELECT "v" FROM "c"))',
+            str(query),
+        )
+
+    def test_parenthesize_is_grouped_alias(self):
+        query_a = Query.from_("a").select("v")
+        query_b = Query.from_("b").select("v")
+        query_c = Query.from_("c").select("v")
+
+        self.assertEqual(
+            str(query_a.union(query_b).grouped().intersect(query_c)),
+            str(query_a.union(query_b).parenthesize().intersect(query_c)),
+        )
+
+    def test_grouped_operation_preserves_all_quantifier(self):
+        query_a = Query.from_("a").select("v")
+        query_b = Query.from_("b").select("v")
+        query_c = Query.from_("c").select("v")
+
+        query = query_a.union_all(query_b).grouped().intersect(query_c)
+
+        self.assertEqual(
+            '((SELECT "v" FROM "a") UNION ALL (SELECT "v" FROM "b")) INTERSECT (SELECT "v" FROM "c")',
+            str(query),
+        )
+
+    def test_operand_order_and_limit_remain_inside_group(self):
+        query_a = Query.from_("a").select("v").orderby("v").limit(1)
+        query_b = Query.from_("b").select("v")
+        query_c = Query.from_("c").select("v")
+
+        query = query_a.union(query_b).grouped().intersect(query_c).orderby("v").limit(5)
+
+        self.assertEqual(
+            '((SELECT "v" FROM "a" ORDER BY "v" LIMIT 1) UNION (SELECT "v" FROM "b")) '
+            'INTERSECT (SELECT "v" FROM "c") ORDER BY "v" LIMIT 5',
+            str(query),
+        )
+
+    def test_grouped_set_operation_as_subquery_alias(self):
+        query_a = Query.from_("a").select("v")
+        query_b = Query.from_("b").select("v")
+        query_c = Query.from_("c").select("v")
+        grouped = query_a.union(query_b).grouped().intersect(query_c)
+
+        query = Query.from_(grouped).select("*")
+
+        self.assertEqual(
+            'SELECT * FROM (((SELECT "v" FROM "a") UNION (SELECT "v" FROM "b")) '
+            'INTERSECT (SELECT "v" FROM "c")) "sq0"',
+            str(query),
+        )
+
+    def test_nested_operand_validates_column_count(self):
+        query_a = Query.from_("a").select("v")
+        query_b = Query.from_("b").select("v", "w")
+        query_c = Query.from_("c").select("v")
+
+        with self.assertRaises(SetOperationException):
+            str(query_a.union(query_b.intersect(query_c).grouped()))
+
+    def test_clickhouse_uses_derived_table_for_grouped_set_operation(self):
+        query_a = ClickHouseQuery.from_("a").select("v")
+        query_b = ClickHouseQuery.from_("b").select("v")
+        query_c = ClickHouseQuery.from_("c").select("v")
+
+        query = query_a.union(query_b).grouped().intersect(query_c)
+
+        self.assertEqual(
+            '(SELECT * FROM (SELECT "v" FROM "a" UNION SELECT "v" FROM "b") '
+            'set_operation_operand) INTERSECT SELECT "v" FROM "c"',
+            str(query),
+        )
+
+    def test_sqlite_grouped_operations_have_different_results(self):
+        connection = sqlite3.connect(":memory:")
+        cursor = connection.cursor()
+        cursor.execute("CREATE TABLE a (v INTEGER)")
+        cursor.execute("CREATE TABLE b (v INTEGER)")
+        cursor.execute("CREATE TABLE c (v INTEGER)")
+        cursor.executemany("INSERT INTO a VALUES (?)", [(1,), (2,)])
+        cursor.executemany("INSERT INTO b VALUES (?)", [(2,), (3,)])
+        cursor.executemany("INSERT INTO c VALUES (?)", [(2,), (4,)])
+
+        query_a = SQLLiteQuery.from_("a").select("v")
+        query_b = SQLLiteQuery.from_("b").select("v")
+        query_c = SQLLiteQuery.from_("c").select("v")
+
+        left_grouped = query_a.union(query_b).grouped().intersect(query_c)
+        right_grouped = query_a.union(query_b.intersect(query_c).grouped())
+        plain_union = Query.from_("a").select("v").union(Query.from_("b").select("v")).union(
+            Query.from_("c").select("v")
+        )
+        sqlite_plain_union = query_a.union(query_b).union(query_c)
+
+        left_result = cursor.execute(left_grouped.get_sql(quote_char=None)).fetchall()
+        right_result = cursor.execute(right_grouped.get_sql(quote_char=None)).fetchall()
+        plain_result = cursor.execute(sqlite_plain_union.get_sql(quote_char=None)).fetchall()
+
+        self.assertEqual([(2,)], sorted(left_result))
+        self.assertEqual([(1,), (2,)], sorted(right_result))
+        self.assertEqual([(1,), (2,), (3,), (4,)], sorted(plain_result))
+        self.assertEqual(
+            '(SELECT v FROM a) UNION (SELECT v FROM b) UNION (SELECT v FROM c)',
+            plain_union.get_sql(quote_char=None),
+        )
+
+        connection.close()
+
+    def test_sqlite_multiple_grouped_operations_use_unique_cte_names(self):
+        connection = sqlite3.connect(":memory:")
+        cursor = connection.cursor()
+        cursor.execute("CREATE TABLE a (v INTEGER)")
+        cursor.execute("CREATE TABLE b (v INTEGER)")
+        cursor.execute("CREATE TABLE c (v INTEGER)")
+        cursor.execute("CREATE TABLE d (v INTEGER)")
+        for table_name in "abcd":
+            cursor.execute(f"INSERT INTO {table_name} VALUES (1)")
+
+        query_a = SQLLiteQuery.from_("a").select("v")
+        query_b = SQLLiteQuery.from_("b").select("v")
+        query_c = SQLLiteQuery.from_("c").select("v")
+        query_d = SQLLiteQuery.from_("d").select("v")
+
+        query = query_a.union(query_b).grouped().intersect(query_c).union(query_d.intersect(query_a).grouped())
+
+        self.assertEqual([(1,)], cursor.execute(query.get_sql(quote_char=None)).fetchall())
+        self.assertIn("set_operation_operand_1", str(query))
+        self.assertIn("set_operation_operand_2", str(query))
+
+        connection.close()
 
 
 class InsertQueryJoinTests(unittest.TestCase):

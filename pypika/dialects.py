@@ -769,7 +769,11 @@ class ClickHouseQuery(Query):
     @classmethod
     def _builder(cls, **kwargs: Any) -> ClickHouseQueryBuilder:
         return ClickHouseQueryBuilder(
-            dialect=Dialects.CLICKHOUSE, wrap_set_operation_queries=False, as_keyword=True, **kwargs
+            dialect=Dialects.CLICKHOUSE,
+            wrap_set_operation_queries=False,
+            wrap_grouped_set_operation_queries=False,
+            as_keyword=True,
+            **kwargs,
         )
 
     @classmethod
@@ -956,6 +960,8 @@ class SQLLiteQueryBuilder(QueryBuilder):
     QUERY_CLS = SQLLiteQuery
 
     def __init__(self, **kwargs: Any) -> None:
+        kwargs.setdefault("wrap_set_operation_queries", False)
+        kwargs.setdefault("wrap_grouped_set_operation_queries", False)
         super().__init__(dialect=Dialects.SQLLITE, wrapper_cls=SQLLiteValueWrapper, **kwargs)
         self._insert_or_replace = False
 
