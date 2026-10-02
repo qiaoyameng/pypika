@@ -879,6 +879,32 @@ You can use as much as `.with_()` as you want.
 
     WITH an_alias AS (SELECT * FROM "customers") SELECT * FROM an_alias
 
+A small temporary relation can be built with ``Values``. Explicit columns are required when the relation is empty,
+and PostgreSQL is used for a direct ``FROM`` relation while SQLite uses the named CTE form.
+
+.. code-block:: python
+
+    from pypika import AliasedQuery, PostgreSQLQuery, Query, Values
+
+    weights = Values(
+        [(1, 1.5, None)],
+        columns=['id', 'weight', 'note'],
+        alias='w',
+    )
+
+    postgres_query = PostgreSQLQuery.from_(weights).select(weights.id, weights.weight)
+
+    sqlite_query = (
+        Query.with_(weights, 'weights')
+        .from_(AliasedQuery('weights'))
+        .select('id', 'weight')
+    )
+
+.. code-block:: sql
+
+    SELECT "w"."id","w"."weight" FROM (VALUES (1,1.5,null)) "w"("id","weight","note")
+    WITH weights(id,weight,note) AS (VALUES (1,1.5,null)) SELECT "weights"."id","weights"."weight" FROM weights
+
 
 Inserting Data
 ^^^^^^^^^^^^^^
